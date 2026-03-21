@@ -2,6 +2,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import readline from "readline";
+import type { Attachment } from "../adapters/base";
 import type { Logger } from "../logger";
 
 export interface ThreadInitContext {
@@ -12,14 +13,20 @@ export interface ThreadInitContext {
 
 export interface TurnRequest {
   threadId: string;
+  channel: string;
   messageText: string;
   workspaceCwd: string;
   senderName: string;
+  senderId: string;
+  conversationId: string;
+  conversationName: string;
+  attachments: Attachment[];
 }
 
 export interface TurnResult {
   turnId: string;
   finalResponse: string;
+  attachments: Attachment[];
 }
 
 export interface ApprovalRequest {
@@ -67,6 +74,7 @@ interface PendingRequest<T = unknown> {
 interface ActiveTurnState {
   turnId: string;
   itemTexts: Map<string, string>;
+  generatedAttachmentPaths: string[];
   latestItemId?: string;
   resolve: (result: TurnResult) => void;
   reject: (error: Error) => void;
@@ -92,11 +100,17 @@ interface TurnStartResult {
   turn: { id: string; status: string };
 }
 
+interface SkillDefinition {
+  name: "imagegen" | "speech" | "transcribe";
+  path: string;
+}
+
 export class AppServerClient {
   private readonly pendingRequests = new Map<string, PendingRequest>();
   private readonly activeTurns = new Map<string, ActiveTurnState>();
   private readonly pendingApprovals = new Map<string, PendingApprovalState>();
   private readonly pendingAvatarByThreadId = new Map<string, string>();
+  private mediaSkillsPromise?: Promise<SkillDefinition[]>;
 
   private child?: ChildProcessWithoutNullStreams;
   private approvalHandler?: ApprovalRequestHandler;
@@ -159,6 +173,7 @@ export class AppServerClient {
     await this.start();
 
     const input: Array<Record<string, unknown>> = [];
+    const mediaSkills = await this.getAvailableMediaSkills();
     const avatarPath = this.pendingAvatarByThreadId.get(request.threadId);
 
     if (avatarPath) {
@@ -176,7 +191,68 @@ export class AppServerClient {
 
     input.push({
       type: "text",
-      text: `From ${request.senderName}: ${request.messageText}`,
+      text: buildChatContext(request),
+      text_elements: [],
+    });
+
+    if (mediaSkills.length > 0) {
+      input.push({
+        type: "text",
+        text: [
+          `Available media skills for this turn: ${mediaSkills.map((skill) => `$${skill.name}`).join(", ")}.`,
+          "Use $imagegen to generate images, $speech to generate audio, and $transcribe to understand attached audio files.",
+          "If you want CodexClaw to send local media files back to the chat, append this exact block at the very end of your final answer:",
+          "[[codexclaw-send]]",
+          "/absolute/path/to/file",
+          "[[/codexclaw-send]]",
+        ].join("\n"),
+        text_elements: [],
+      });
+
+      for (const skill of mediaSkills) {
+        input.push({
+          type: "skill",
+          name: skill.name,
+          path: skill.path,
+        });
+      }
+    }
+
+    const imageAttachments = request.attachments.filter((attachment) => attachment.type === "image" && attachment.localPath);
+    const fileAttachments = request.attachments.filter((attachment) => attachment.type !== "image" && attachment.localPath);
+
+    if (imageAttachments.length > 0) {
+      input.push({
+        type: "text",
+        text: `The user attached ${imageAttachments.length} image file(s). They are included as local images in this turn.`,
+        text_elements: [],
+      });
+
+      for (const attachment of imageAttachments) {
+        input.push({
+          type: "localImage",
+          path: attachment.localPath,
+        });
+      }
+    }
+
+    if (fileAttachments.length > 0) {
+      input.push({
+        type: "text",
+        text: [
+          "Additional local media files attached to the triggering message:",
+          ...fileAttachments.map((attachment) =>
+            `- ${attachment.type}: ${attachment.localPath}${attachment.name ? ` (${attachment.name})` : ""}`,
+          ),
+          "Use $transcribe if you need to understand audio attachments.",
+        ].join("\n"),
+        text_elements: [],
+      });
+    }
+
+    input.push({
+      type: "text",
+      text: `From ${request.senderName} (${request.senderId}): ${request.messageText}`,
       text_elements: [],
     });
 
@@ -196,6 +272,7 @@ export class AppServerClient {
       this.activeTurns.set(turnId, {
         turnId,
         itemTexts: new Map<string, string>(),
+        generatedAttachmentPaths: [],
         resolve,
         reject,
       });
@@ -424,14 +501,7 @@ export class AppServerClient {
     const turnId = asString(params.turnId);
     const item = params.item as Record<string, unknown> | undefined;
 
-    if (!turnId || !item || item.type !== "agentMessage") {
-      return;
-    }
-
-    const itemId = asString(item.id);
-    const text = asString(item.text);
-
-    if (!itemId || text === undefined) {
+    if (!turnId || !item) {
       return;
     }
 
@@ -441,8 +511,25 @@ export class AppServerClient {
       return;
     }
 
-    turn.itemTexts.set(itemId, text);
-    turn.latestItemId = itemId;
+    if (item.type === "agentMessage") {
+      const itemId = asString(item.id);
+      const text = asString(item.text);
+
+      if (!itemId || text === undefined) {
+        return;
+      }
+
+      turn.itemTexts.set(itemId, text);
+      turn.latestItemId = itemId;
+      return;
+    }
+
+    if (item.type === "imageGeneration") {
+      const savedPath = asString(item.savedPath);
+      if (savedPath) {
+        turn.generatedAttachmentPaths.push(savedPath);
+      }
+    }
   }
 
   private handleTurnCompleted(params: Record<string, unknown>): void {
@@ -468,9 +555,14 @@ export class AppServerClient {
     const status = asString(turn.status);
 
     if (status === "completed") {
+      const parsed = extractAttachmentBlock(this.collectFinalResponse(activeTurn));
       activeTurn.resolve({
         turnId,
-        finalResponse: this.collectFinalResponse(activeTurn),
+        finalResponse: parsed.text,
+        attachments: dedupeAttachments([
+          ...activeTurn.generatedAttachmentPaths.map(localPathToAttachment),
+          ...parsed.attachments.map(localPathToAttachment),
+        ]),
       });
       return;
     }
@@ -549,6 +641,14 @@ export class AppServerClient {
     if (this.child && !this.child.killed) {
       this.child.kill();
     }
+  }
+
+  private async getAvailableMediaSkills(): Promise<SkillDefinition[]> {
+    if (!this.mediaSkillsPromise) {
+      this.mediaSkillsPromise = discoverMediaSkills();
+    }
+
+    return await this.mediaSkillsPromise;
   }
 }
 
@@ -699,4 +799,87 @@ async function fileExists(filePath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function discoverMediaSkills(): Promise<SkillDefinition[]> {
+  const codexHome = process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "", ".codex");
+  const skillNames: SkillDefinition["name"][] = ["imagegen", "speech", "transcribe"];
+  const found: SkillDefinition[] = [];
+
+  for (const name of skillNames) {
+    const skillPath = path.join(codexHome, "skills", name, "SKILL.md");
+    if (await fileExists(skillPath)) {
+      found.push({ name, path: skillPath });
+    }
+  }
+
+  return found;
+}
+
+function buildChatContext(request: TurnRequest): string {
+  return [
+    "[Chat Context]",
+    `channel: ${request.channel}`,
+    "chat_type: group",
+    `chat_name: ${request.conversationName}`,
+    `chat_guid: ${request.conversationId}`,
+    `sender_name: ${request.senderName}`,
+    `sender_id: ${request.senderId}`,
+  ].join("\n");
+}
+
+function extractAttachmentBlock(text: string): { text: string; attachments: string[] } {
+  const pattern = /\[\[codexclaw-send\]\]\s*([\s\S]*?)\s*\[\[\/codexclaw-send\]\]/gi;
+  const attachments: string[] = [];
+  let match: RegExpExecArray | null = null;
+
+  while ((match = pattern.exec(text)) !== null) {
+    for (const line of match[1].split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed.length > 0 && path.isAbsolute(trimmed)) {
+        attachments.push(trimmed);
+      }
+    }
+  }
+
+  const cleaned = text.replace(pattern, "").trim();
+  return { text: cleaned, attachments };
+}
+
+function localPathToAttachment(localPath: string): Attachment {
+  return {
+    localPath,
+    name: path.basename(localPath),
+    type: classifyLocalPath(localPath),
+  };
+}
+
+function dedupeAttachments(attachments: Attachment[]): Attachment[] {
+  const byPath = new Map<string, Attachment>();
+
+  for (const attachment of attachments) {
+    if (!attachment.localPath) {
+      continue;
+    }
+
+    if (!byPath.has(attachment.localPath)) {
+      byPath.set(attachment.localPath, attachment);
+    }
+  }
+
+  return Array.from(byPath.values());
+}
+
+function classifyLocalPath(localPath: string): Attachment["type"] {
+  const ext = path.extname(localPath).toLowerCase();
+
+  if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic"].includes(ext)) {
+    return "image";
+  }
+
+  if ([".m4a", ".mp3", ".wav", ".caf", ".aac", ".flac", ".ogg"].includes(ext)) {
+    return "audio";
+  }
+
+  return "file";
 }

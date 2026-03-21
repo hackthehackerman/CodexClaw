@@ -1,5 +1,5 @@
 import type { Logger } from "../logger";
-import type { ChannelAdapter, MessageHandler, OutboundMessage } from "./base";
+import type { Attachment, ChannelAdapter, MessageHandler, OutboundMessage } from "./base";
 
 export class WhatsAppAdapter implements ChannelAdapter {
   readonly channel = "whatsapp" as const;
@@ -28,5 +28,8 @@ export class WhatsAppAdapter implements ChannelAdapter {
       text: message.text,
     });
   }
-}
 
+  async materializeAttachment(attachment: Attachment): Promise<Attachment> {
+    return attachment;
+  }
+}

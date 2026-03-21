@@ -1,3 +1,4 @@
+import { promises as fs } from "fs";
 import type { ChannelAdapter, InboundMessage } from "../adapters/base";
 import type { CodexClawConfig } from "../config/schema";
 import { parseAdminCommand } from "../core/approvalCommands";
@@ -70,8 +71,8 @@ export class Gateway {
       return;
     }
 
-    if (message.isFromSelf) {
-      this.logger.debug("Ignoring self-authored message", { conversationId: message.conversationId });
+    if (message.isBotEcho) {
+      this.logger.debug("Ignoring bot-authored echo", { conversationId: message.conversationId });
       return;
     }
 
@@ -110,9 +111,14 @@ export class Gateway {
 
         const result = await this.codex.runTurn({
           threadId,
+          channel: message.channel,
           messageText: this.stripTriggerPrefix(message.text),
           workspaceCwd: context.workspace.cwd,
           senderName: message.senderName,
+          senderId: message.senderId,
+          conversationId: message.conversationId,
+          conversationName: context.route.name ?? message.conversationId,
+          attachments: await this.materializeAttachments(message),
         });
 
         await this.store.updateRun(run.id, {
@@ -121,7 +127,12 @@ export class Gateway {
           completedAt: new Date().toISOString(),
         });
 
-        await this.sendMessage(message.adapterId, message.conversationId, result.finalResponse);
+        await this.sendMessage(
+          message.adapterId,
+          message.conversationId,
+          result.finalResponse,
+          await this.filterExistingAttachments(result.attachments),
+        );
       } catch (error) {
         await this.store.updateRun(run.id, {
           status: "failed",
@@ -213,14 +224,19 @@ export class Gateway {
     );
   }
 
-  private async sendMessage(adapterId: string, conversationId: string, text: string): Promise<void> {
+  private async sendMessage(
+    adapterId: string,
+    conversationId: string,
+    text: string,
+    attachments: InboundMessage["attachments"] = [],
+  ): Promise<void> {
     const adapter = this.adaptersById.get(adapterId);
 
     if (!adapter) {
       throw new Error(`Unknown adapter: ${adapterId}`);
     }
 
-    await adapter.sendMessage({ conversationId, text });
+    await adapter.sendMessage({ conversationId, text, attachments });
   }
 
   private hasTriggerPrefix(text: string): boolean {
@@ -247,6 +263,55 @@ export class Gateway {
 
   private queueKey(message: InboundMessage): string {
     return `${message.adapterId}:${message.conversationId}`;
+  }
+
+  private async materializeAttachments(message: InboundMessage): Promise<InboundMessage["attachments"]> {
+    const adapter = this.adaptersById.get(message.adapterId);
+
+    if (!adapter || message.attachments.length === 0) {
+      return [];
+    }
+
+    const materialized = await Promise.all(
+      message.attachments.map(async (attachment) => {
+        try {
+          return await adapter.materializeAttachment(attachment);
+        } catch (error) {
+          this.logger.warn("Failed to materialize inbound attachment", {
+            adapterId: message.adapterId,
+            conversationId: message.conversationId,
+            attachmentId: attachment.id,
+            attachmentName: attachment.name,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return undefined;
+        }
+      }),
+    );
+
+    return materialized.filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== undefined);
+  }
+
+  private async filterExistingAttachments(attachments: InboundMessage["attachments"]): Promise<InboundMessage["attachments"]> {
+    const existing = await Promise.all(
+      attachments.map(async (attachment) => {
+        if (!attachment.localPath) {
+          return undefined;
+        }
+
+        try {
+          await fs.access(attachment.localPath);
+          return attachment;
+        } catch {
+          this.logger.warn("Skipping outbound attachment because the file does not exist", {
+            localPath: attachment.localPath,
+          });
+          return undefined;
+        }
+      }),
+    );
+
+    return existing.filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== undefined);
   }
 }
 

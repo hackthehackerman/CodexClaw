@@ -1,6 +1,6 @@
 import type { IMessageAdapterConfig } from "../config/schema";
 import type { Logger } from "../logger";
-import type { ChannelAdapter, MessageHandler, OutboundMessage } from "./base";
+import type { Attachment, ChannelAdapter, MessageHandler, OutboundMessage } from "./base";
 import { BlueBubblesIMessageAdapter } from "./imessage/blueBubblesAdapter";
 
 export class IMessageAdapter implements ChannelAdapter {
@@ -37,5 +37,9 @@ export class IMessageAdapter implements ChannelAdapter {
 
   async sendMessage(message: OutboundMessage): Promise<void> {
     await this.delegate.sendMessage(message);
+  }
+
+  async materializeAttachment(attachment: Attachment): Promise<Attachment> {
+    return await this.delegate.materializeAttachment(attachment);
   }
 }

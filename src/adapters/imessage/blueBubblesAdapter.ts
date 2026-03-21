@@ -1,6 +1,9 @@
 import http from "http";
 import https from "https";
+import os from "os";
+import path from "path";
 import { URL } from "url";
+import { promises as fs } from "fs";
 import { z } from "zod";
 import type { BlueBubblesIMessageAdapterConfig } from "../../config/schema";
 import type { Logger } from "../../logger";
@@ -22,6 +25,8 @@ const blueBubblesWebhookEnvelopeSchema = z.object({
       displayName: z.string().nullable().optional(),
     })).optional(),
     attachments: z.array(z.object({
+      guid: z.string().nullable().optional(),
+      uti: z.string().nullable().optional(),
       mimeType: z.string().nullable().optional(),
       transferName: z.string().nullable().optional(),
       name: z.string().nullable().optional(),
@@ -44,6 +49,13 @@ interface BlueBubblesWebhookRegistration {
   events?: string[];
 }
 
+interface RecentOutgoingMessage {
+  conversationId: string;
+  text: string;
+  attachmentNames: string[];
+  sentAt: number;
+}
+
 export class BlueBubblesIMessageAdapter implements ChannelAdapter {
   readonly channel = "imessage" as const;
   readonly id: string;
@@ -51,6 +63,7 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
   private handler?: MessageHandler;
   private server?: http.Server;
   private nextTempGuid = 1;
+  private readonly recentOutgoingMessages: RecentOutgoingMessage[] = [];
 
   constructor(
     private readonly config: BlueBubblesIMessageAdapterConfig,
@@ -100,26 +113,90 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
   }
 
   async sendMessage(message: OutboundMessage): Promise<void> {
-    if (message.attachments && message.attachments.length > 0) {
-      throw new Error("BlueBubbles text send is implemented first; attachments are not supported yet.");
+    const attachments = message.attachments ?? [];
+
+    if (message.text.trim().length > 0) {
+      this.rememberOutgoingMessage({
+        conversationId: message.conversationId,
+        text: message.text,
+        attachmentNames: [],
+      });
+
+      const response = await this.requestJson<BlueBubblesWebhookRegistration>(
+        "POST",
+        "/api/v1/message/text",
+        {
+          chatGuid: message.conversationId,
+          message: message.text,
+          method: "apple-script",
+          tempGuid: this.generateTempGuid(),
+        },
+      );
+
+      this.logger.info("Sent BlueBubbles iMessage", {
+        adapterId: this.id,
+        conversationId: message.conversationId,
+        responseMessage: response.message,
+      });
     }
 
-    const response = await this.requestJson<BlueBubblesWebhookRegistration>(
-      "POST",
-      "/api/v1/message/text",
-      {
-        chatGuid: message.conversationId,
-        message: message.text,
-        method: "apple-script",
-        tempGuid: this.generateTempGuid(),
-      },
-    );
+    for (const attachment of attachments) {
+      if (!attachment.localPath) {
+        throw new Error(`Attachment is missing localPath: ${attachment.name ?? attachment.id ?? "unknown"}`);
+      }
 
-    this.logger.info("Sent BlueBubbles iMessage", {
-      adapterId: this.id,
-      conversationId: message.conversationId,
-      responseMessage: response.message,
-    });
+      this.rememberOutgoingMessage({
+        conversationId: message.conversationId,
+        text: "",
+        attachmentNames: [attachment.name ?? path.basename(attachment.localPath)],
+      });
+
+      const response = await this.requestMultipartJson<BlueBubblesWebhookRegistration>(
+        "/api/v1/message/attachment",
+        {
+          chatGuid: message.conversationId,
+          tempGuid: this.generateTempGuid(),
+          method: "apple-script",
+          name: attachment.name ?? path.basename(attachment.localPath),
+          isAudioMessage: isAudioAttachment(attachment) ? "true" : "false",
+        },
+        attachment.localPath,
+        attachment.name ?? path.basename(attachment.localPath),
+        attachment.mimeType,
+      );
+
+      this.logger.info("Sent BlueBubbles attachment", {
+        adapterId: this.id,
+        conversationId: message.conversationId,
+        localPath: attachment.localPath,
+        responseMessage: response.message,
+      });
+    }
+  }
+
+  async materializeAttachment(attachment: Attachment): Promise<Attachment> {
+    if (attachment.localPath) {
+      return attachment;
+    }
+
+    if (!attachment.id) {
+      throw new Error("BlueBubbles attachment is missing guid");
+    }
+
+    const download = await this.requestBinary("GET", `/api/v1/attachment/${encodeURIComponent(attachment.id)}/download`);
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codexclaw-bluebubbles-"));
+    const contentType = download.contentType ?? attachment.mimeType;
+    const fileName = attachment.name ?? `${attachment.id}${extensionForAttachment(contentType, attachment.type)}`;
+    const localPath = path.join(tempDir, sanitizeFileName(fileName));
+
+    await fs.writeFile(localPath, download.body);
+
+    return {
+      ...attachment,
+      name: attachment.name ?? path.basename(localPath),
+      mimeType: contentType,
+      localPath,
+    };
   }
 
   private async startWebhookServer(): Promise<void> {
@@ -215,6 +292,12 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
 
     const senderId = envelope.data.handle?.address ?? (envelope.data.isFromMe ? "self" : "unknown");
     const senderName = envelope.data.handle?.address ?? chat.displayName ?? senderId;
+    const attachments = this.normalizeAttachments(envelope.data.attachments ?? []);
+    const isBotEcho = Boolean(envelope.data.isFromMe) && this.matchesRecentOutgoingMessage({
+      conversationId: chat.guid,
+      text: envelope.data.text ?? envelope.data.subject ?? "",
+      attachmentNames: attachments.map((attachment) => attachment.name ?? ""),
+    });
 
     return {
       adapterId: this.id,
@@ -223,20 +306,28 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
       senderId,
       senderName,
       text: envelope.data.text ?? envelope.data.subject ?? "",
-      attachments: this.normalizeAttachments(envelope.data.attachments ?? []),
+      attachments,
       isFromSelf: envelope.data.isFromMe ?? false,
+      isBotEcho,
       receivedAt: toIsoTimestamp(envelope.data.dateCreated),
       raw: envelope,
     };
   }
 
   private normalizeAttachments(
-    attachments: Array<{ mimeType?: string | null; transferName?: string | null; name?: string | null }>,
+    attachments: Array<{
+      guid?: string | null;
+      uti?: string | null;
+      mimeType?: string | null;
+      transferName?: string | null;
+      name?: string | null;
+    }>,
   ): Attachment[] {
     return attachments.map((attachment) => ({
-      type: attachment.mimeType?.startsWith("image/") ? "image" : "file",
+      id: attachment.guid ?? undefined,
+      type: classifyAttachmentType(attachment.mimeType, attachment.uti, attachment.transferName, attachment.name),
+      name: attachment.transferName ?? attachment.name ?? undefined,
       mimeType: attachment.mimeType ?? undefined,
-      url: attachment.transferName ?? attachment.name ?? undefined,
     }));
   }
 
@@ -369,8 +460,162 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
     });
   }
 
+  private async requestBinary(
+    method: "GET",
+    endpointPath: string,
+  ): Promise<{ body: Buffer; contentType?: string }> {
+    const url = new URL(endpointPath, normalizeBaseUrl(this.config.config.serverUrl));
+    url.searchParams.set("password", this.config.config.password);
+    const transport = url.protocol === "https:" ? https : http;
+
+    return await new Promise<{ body: Buffer; contentType?: string }>((resolve, reject) => {
+      const request = transport.request(
+        url,
+        { method },
+        (response) => {
+          const chunks: Buffer[] = [];
+
+          response.on("data", (chunk) => {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          });
+
+          response.on("end", () => {
+            const body = Buffer.concat(chunks);
+
+            if ((response.statusCode ?? 500) >= 400) {
+              reject(new Error(`BlueBubbles request failed (${response.statusCode ?? "unknown"})`));
+              return;
+            }
+
+            resolve({
+              body,
+              contentType: response.headers["content-type"],
+            });
+          });
+
+          response.on("error", reject);
+        },
+      );
+
+      request.on("error", reject);
+      request.end();
+    });
+  }
+
+  private async requestMultipartJson<T>(
+    endpointPath: string,
+    fields: Record<string, string>,
+    filePath: string,
+    fileName: string,
+    mimeType?: string,
+  ): Promise<BlueBubblesSuccessResponse<T>> {
+    const url = new URL(endpointPath, normalizeBaseUrl(this.config.config.serverUrl));
+    url.searchParams.set("password", this.config.config.password);
+    const boundary = `----codexclaw-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const fileContents = await fs.readFile(filePath);
+    const parts: Buffer[] = [];
+
+    for (const [key, value] of Object.entries(fields)) {
+      parts.push(Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`,
+        "utf8",
+      ));
+    }
+
+    parts.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="attachment"; filename="${escapeHeaderValue(fileName)}"\r\nContent-Type: ${mimeType ?? "application/octet-stream"}\r\n\r\n`,
+      "utf8",
+    ));
+    parts.push(fileContents);
+    parts.push(Buffer.from(`\r\n--${boundary}--\r\n`, "utf8"));
+
+    const requestBody = Buffer.concat(parts);
+    const transport = url.protocol === "https:" ? https : http;
+
+    return await new Promise<BlueBubblesSuccessResponse<T>>((resolve, reject) => {
+      const request = transport.request(
+        url,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            "Content-Length": String(requestBody.byteLength),
+          },
+        },
+        (response) => {
+          const chunks: Buffer[] = [];
+
+          response.on("data", (chunk) => {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          });
+
+          response.on("end", () => {
+            const rawText = Buffer.concat(chunks).toString("utf8");
+            const parsed = rawText.length > 0
+              ? (JSON.parse(rawText) as BlueBubblesSuccessResponse<T>)
+              : { status: response.statusCode ?? 0, message: "" };
+
+            if ((response.statusCode ?? 500) >= 400) {
+              reject(
+                new Error(
+                  `BlueBubbles multipart request failed (${response.statusCode ?? "unknown"}): ${
+                    parsed.message || rawText || "Unknown error"
+                  }`,
+                ),
+              );
+              return;
+            }
+
+            resolve(parsed);
+          });
+
+          response.on("error", reject);
+        },
+      );
+
+      request.on("error", reject);
+      request.write(requestBody);
+      request.end();
+    });
+  }
+
   private generateTempGuid(): string {
     return `codexclaw-${Date.now()}-${this.nextTempGuid++}`;
+  }
+
+  private rememberOutgoingMessage(message: Omit<RecentOutgoingMessage, "sentAt">): void {
+    this.recentOutgoingMessages.push({
+      ...message,
+      sentAt: Date.now(),
+    });
+    this.pruneRecentOutgoingMessages();
+  }
+
+  private matchesRecentOutgoingMessage(candidate: Pick<RecentOutgoingMessage, "conversationId" | "text" | "attachmentNames">): boolean {
+    this.pruneRecentOutgoingMessages();
+
+    const normalizedText = normalizeMessageText(candidate.text);
+    const normalizedAttachmentNames = normalizeAttachmentNames(candidate.attachmentNames);
+
+    const index = this.recentOutgoingMessages.findIndex((message) =>
+      message.conversationId === candidate.conversationId
+      && normalizeMessageText(message.text) === normalizedText
+      && arraysEqual(normalizeAttachmentNames(message.attachmentNames), normalizedAttachmentNames),
+    );
+
+    if (index === -1) {
+      return false;
+    }
+
+    this.recentOutgoingMessages.splice(index, 1);
+    return true;
+  }
+
+  private pruneRecentOutgoingMessages(): void {
+    const cutoff = Date.now() - 2 * 60 * 1000;
+    while (this.recentOutgoingMessages.length > 0 && this.recentOutgoingMessages[0].sentAt < cutoff) {
+      this.recentOutgoingMessages.shift();
+    }
   }
 }
 
@@ -380,4 +625,108 @@ function normalizeBaseUrl(value: string): string {
 
 function toIsoTimestamp(dateCreated?: number | null): string {
   return dateCreated ? new Date(dateCreated).toISOString() : new Date().toISOString();
+}
+
+function classifyAttachmentType(
+  mimeType?: string | null,
+  uti?: string | null,
+  transferName?: string | null,
+  name?: string | null,
+): Attachment["type"] {
+  const fileName = (transferName ?? name ?? "").toLowerCase();
+  const lowerMime = mimeType?.toLowerCase();
+  const lowerUti = uti?.toLowerCase();
+
+  if (lowerMime?.startsWith("image/")) {
+    return "image";
+  }
+
+  if (
+    lowerMime?.startsWith("audio/")
+    || lowerUti === "com.apple.coreaudio-format"
+    || /\.(m4a|mp3|wav|caf|aac|flac|ogg)$/i.test(fileName)
+  ) {
+    return "audio";
+  }
+
+  return "file";
+}
+
+function extensionForAttachment(mimeType: string | undefined, type: Attachment["type"]): string {
+  if (mimeType) {
+    const normalized = mimeType.split(";")[0].trim().toLowerCase();
+    const known = mimeToExtension(normalized);
+    if (known) {
+      return known;
+    }
+  }
+
+  switch (type) {
+    case "image":
+      return ".png";
+    case "audio":
+      return ".m4a";
+    default:
+      return ".bin";
+  }
+}
+
+function mimeToExtension(mimeType: string): string | undefined {
+  switch (mimeType) {
+    case "image/jpeg":
+      return ".jpg";
+    case "image/png":
+      return ".png";
+    case "image/gif":
+      return ".gif";
+    case "image/webp":
+      return ".webp";
+    case "image/heic":
+      return ".heic";
+    case "audio/mp4":
+    case "audio/x-m4a":
+      return ".m4a";
+    case "audio/mpeg":
+      return ".mp3";
+    case "audio/wav":
+    case "audio/x-wav":
+      return ".wav";
+    case "audio/x-caf":
+      return ".caf";
+    case "audio/aac":
+      return ".aac";
+    default:
+      return undefined;
+  }
+}
+
+function sanitizeFileName(value: string): string {
+  return value.replace(/[\\/:\0]/g, "_");
+}
+
+function escapeHeaderValue(value: string): string {
+  return value.replace(/"/g, "_");
+}
+
+function isAudioAttachment(attachment: Attachment): boolean {
+  return attachment.type === "audio" || attachment.mimeType?.startsWith("audio/") === true;
+}
+
+function normalizeMessageText(value: string): string {
+  return value.trim();
+}
+
+function normalizeAttachmentNames(values: string[]): string[] {
+  return values
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => value.length > 0)
+    .sort();
+}
+
+function arraysEqual(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((value, index) => value === right[index]);
 }

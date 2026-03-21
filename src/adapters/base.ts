@@ -1,8 +1,9 @@
 export type ChannelName = "imessage" | "whatsapp";
 
 export interface Attachment {
-  type: "image" | "file";
-  url?: string;
+  id?: string;
+  type: "image" | "audio" | "file";
+  name?: string;
   localPath?: string;
   mimeType?: string;
 }
@@ -17,6 +18,7 @@ export interface InboundMessage {
   attachments: Attachment[];
   replyToId?: string;
   isFromSelf: boolean;
+  isBotEcho?: boolean;
   receivedAt: string;
   raw: unknown;
 }
@@ -36,5 +38,5 @@ export interface ChannelAdapter {
   start(handler: MessageHandler): Promise<void>;
   stop(): Promise<void>;
   sendMessage(message: OutboundMessage): Promise<void>;
+  materializeAttachment(attachment: Attachment): Promise<Attachment>;
 }
-
