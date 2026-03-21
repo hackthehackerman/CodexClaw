@@ -1,0 +1,61 @@
+[bot]
+name = "CodexClaw"
+aliases = ["@claw", "claw"]
+developer_instructions_path = "./prompts/system.md"
+avatar_path = "./assets/avatar.png"
+
+[codex]
+command = ["codex", "app-server"]
+approval_policy = "untrusted"
+sandbox = "workspace-write"
+model = "gpt-5.4"
+effort = "medium"
+summary = "concise"
+
+[storage]
+db_path = "./var/codexclaw.db"
+
+[[adapters]]
+id = "primary-imessage"
+type = "imessage"
+provider = "bluebubbles"
+enabled = true
+
+[adapters.config]
+server_url = "http://127.0.0.1:1234"
+password = "replace-with-bluebubbles-server-password"
+webhook_listen_host = "127.0.0.1"
+webhook_listen_port = 4101
+webhook_path = "/webhooks/bluebubbles"
+webhook_public_url = "http://127.0.0.1:4101/webhooks/bluebubbles"
+webhook_token = "replace-with-random-token"
+auto_register_webhook = true
+webhook_events = ["new-message"]
+
+# Routes are the conversation allowlist.
+# CodexClaw ignores any inbound message from a chat that is not listed here.
+[[routes]]
+name = "allowed group chat"
+adapter_id = "primary-imessage"
+conversation_id = "any;+;GROUP_CHAT_GUID"
+workspace_id = "main"
+mention_required = true
+role = "user"
+
+[[routes]]
+name = "operator approvals"
+adapter_id = "primary-imessage"
+conversation_id = "iMessage;-;ADMIN_CHAT_GUID"
+workspace_id = "main"
+mention_required = false
+role = "admin"
+allowed_sender_ids = ["OWNER_HANDLE_OR_EMAIL"]
+
+[approvals]
+target_adapter_id = "primary-imessage"
+target_conversation_id = "iMessage;-;ADMIN_CHAT_GUID"
+command_format = "strict"
+
+[[workspaces]]
+id = "main"
+cwd = "/absolute/path/to/workspace"
