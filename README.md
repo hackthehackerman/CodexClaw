@@ -44,7 +44,6 @@ From the workspace where you want CodexClaw to run:
 
 ```bash
 codexclaw init
-codexclaw doctor
 codexclaw start
 ```
 
@@ -72,8 +71,7 @@ That means nobody can message Yanny until you explicitly configure access.
 2. Enable one transport
 3. Add one narrow allow rule so only you can message it
 4. If you keep `approval_policy = "untrusted"`, add an admin route
-5. Run `codexclaw doctor`
-6. Run `codexclaw start`
+5. Run `codexclaw start`
 
 See the full setup guide in [docs/quickstart.md](docs/quickstart.md).
 
@@ -81,11 +79,8 @@ See the full setup guide in [docs/quickstart.md](docs/quickstart.md).
 
 ```bash
 codexclaw init
-codexclaw doctor
 codexclaw start
 ```
-
-`codexclaw doctor --offline` skips live Telegram and BlueBubbles reachability checks. It is useful for template validation and release smoke tests.
 
 You can also pass an explicit config path:
 

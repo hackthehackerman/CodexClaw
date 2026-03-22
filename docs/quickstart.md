@@ -124,27 +124,7 @@ Do not start with:
 
 Widen later after the bot is stable.
 
-## 5. Run the doctor
-
-```bash
-codexclaw doctor
-```
-
-or, if you only want config validation without network checks:
-
-```bash
-codexclaw doctor --offline
-```
-
-It checks:
-- config loads
-- soul file exists
-- `codex` command is runnable
-- Telegram token works if Telegram is enabled
-- BlueBubbles is reachable if iMessage is enabled
-- no obvious “nobody can talk to the bot” mistakes
-
-## 6. Start CodexClaw
+## 5. Start CodexClaw
 
 ```bash
 codexclaw start
@@ -156,7 +136,7 @@ By default, the control page is available at:
 http://127.0.0.1:4188
 ```
 
-## 7. Expand carefully
+## 6. Expand carefully
 
 After the first successful run, you can widen access by adding rules like:
 

@@ -240,13 +240,11 @@ function printHelp(): void {
   console.log("");
   console.log("Usage:");
   console.log("  codexclaw init [path]");
-  console.log("  codexclaw doctor [path]");
   console.log("  codexclaw start [path]");
   console.log("");
   console.log("Options:");
   console.log("  --config <path>   Use an explicit config path");
   console.log("  --force           Overwrite files during init");
-  console.log("  --offline         Skip live transport checks during doctor");
   console.log("");
   console.log("Init presets:");
   console.log("  --telegram-chat <chat-id>              Enable Telegram and allow only that DM");
@@ -658,21 +656,18 @@ function printInitNextSteps(configPath: string, preset: InitPreset): void {
     console.log(`1. Edit ${configPath} and enable one transport.`);
     console.log("2. Add one narrow allow rule so only you can message Yanny.");
     console.log("3. If you keep approval_policy = \"untrusted\", add an admin route.");
-    console.log("4. Run: codexclaw doctor");
-    console.log("5. Run: codexclaw start");
+    console.log("4. Run: codexclaw start");
     return;
   }
 
   console.log(`1. Review ${configPath} and replace any remaining placeholder secrets.`);
   if (preset.imessageConversationId && !preset.imessageAdminSenderId) {
     console.log("2. Add imessage_admin_sender or switch approval_policy to \"never\" before risky actions.");
-    console.log("3. Run: codexclaw doctor");
-    console.log("4. Run: codexclaw start");
+    console.log("3. Run: codexclaw start");
     return;
   }
 
-  console.log("2. Run: codexclaw doctor");
-  console.log("3. Run: codexclaw start");
+  console.log("2. Run: codexclaw start");
 }
 
 async function requestJson<T>(urlString: string): Promise<T> {
