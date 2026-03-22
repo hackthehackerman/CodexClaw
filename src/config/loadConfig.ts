@@ -5,12 +5,13 @@ import { z } from "zod";
 import type { Logger } from "../logger";
 import { configSchema, type CodexClawConfig } from "./schema";
 
-const rawConfigSchema = z.object({
+export const rawConfigSchema = z.object({
   bot: z.object({
     name: z.string(),
     aliases: z.array(z.string()).optional(),
-    developer_instructions_path: z.string(),
-    avatar_path: z.string().optional(),
+    soul_path: z.string(),
+    workspace_id: z.string(),
+    allow_self_messages: z.boolean().optional(),
   }),
   codex: z
     .object({
@@ -23,19 +24,28 @@ const rawConfigSchema = z.object({
     })
     .optional(),
   storage: z.object({ db_path: z.string().optional() }).optional(),
-  adapters: z.array(z.record(z.unknown())),
-  routes: z.array(z.record(z.unknown())),
-  approvals: z.object({
-    target_adapter_id: z.string(),
-    target_conversation_id: z.string(),
-    command_format: z.string().optional(),
+  web: z.object({
+    enabled: z.boolean().optional(),
+    host: z.string().optional(),
+    port: z.number().optional(),
+  }).optional(),
+  policy: z.object({
+    default: z.string().optional(),
   }),
+  allow: z.array(z.record(z.unknown())).optional(),
+  deny: z.array(z.record(z.unknown())).optional(),
+  admins: z.array(z.object({
+    transport_id: z.string(),
+    conversation_id: z.string(),
+    allowed_sender_ids: z.array(z.string()),
+    command_format: z.string().optional(),
+  })).optional(),
+  transports: z.array(z.record(z.unknown())),
   workspaces: z.array(z.object({ id: z.string(), cwd: z.string() })),
 });
 
 export async function loadConfig(configPath: string, logger: Logger): Promise<CodexClawConfig> {
   const resolvedPath = path.resolve(configPath);
-  const baseDir = path.dirname(resolvedPath);
 
   let rawText: string;
 
@@ -48,6 +58,15 @@ export async function loadConfig(configPath: string, logger: Logger): Promise<Co
     );
   }
 
+  const normalized = parseConfigText(rawText, resolvedPath, logger);
+
+  logger.info("Loaded configuration", { configPath: resolvedPath });
+  return normalized;
+}
+
+export function parseConfigText(rawText: string, configPath: string, logger: Logger): CodexClawConfig {
+  const resolvedPath = path.resolve(configPath);
+  const baseDir = path.dirname(resolvedPath);
   const tomlValue = TOML.parse(rawText);
   const parsed = rawConfigSchema.parse(tomlValue);
 
@@ -55,8 +74,9 @@ export async function loadConfig(configPath: string, logger: Logger): Promise<Co
     bot: {
       name: parsed.bot.name,
       aliases: parsed.bot.aliases ?? [],
-      developerInstructionsPath: resolvePath(baseDir, parsed.bot.developer_instructions_path),
-      avatarPath: parsed.bot.avatar_path ? resolvePath(baseDir, parsed.bot.avatar_path) : undefined,
+      soulPath: resolvePath(baseDir, parsed.bot.soul_path),
+      workspaceId: parsed.bot.workspace_id,
+      allowSelfMessages: parsed.bot.allow_self_messages,
     },
     codex: {
       command: parsed.codex?.command,
@@ -69,13 +89,23 @@ export async function loadConfig(configPath: string, logger: Logger): Promise<Co
     storage: {
       dbPath: resolvePath(baseDir, parsed.storage?.db_path ?? "./var/codexclaw.db"),
     },
-    adapters: parsed.adapters.map(normalizeAdapter),
-    routes: parsed.routes.map(normalizeRoute),
-    approvals: {
-      targetAdapterId: parsed.approvals.target_adapter_id,
-      targetConversationId: parsed.approvals.target_conversation_id,
-      commandFormat: parsed.approvals.command_format ?? "strict",
+    web: {
+      enabled: parsed.web?.enabled,
+      host: parsed.web?.host,
+      port: parsed.web?.port,
     },
+    policy: {
+      default: parsed.policy.default,
+    },
+    allow: (parsed.allow ?? []).map(normalizeAccessRule),
+    deny: (parsed.deny ?? []).map(normalizeAccessRule),
+    admins: (parsed.admins ?? []).map((admin) => ({
+      transportId: admin.transport_id,
+      conversationId: admin.conversation_id,
+      allowedSenderIds: admin.allowed_sender_ids,
+      commandFormat: admin.command_format ?? "strict",
+    })),
+    transports: parsed.transports.map(normalizeTransport),
     workspaces: parsed.workspaces.map((workspace) => ({
       id: workspace.id,
       cwd: resolvePath(baseDir, workspace.cwd),
@@ -83,7 +113,7 @@ export async function loadConfig(configPath: string, logger: Logger): Promise<Co
   });
 
   validateReferences(normalized);
-  logger.info("Loaded configuration", { configPath: resolvedPath });
+  maybeWarnOnTelegramContactScope(normalized, logger);
   return normalized;
 }
 
@@ -91,15 +121,20 @@ function resolvePath(baseDir: string, value: string): string {
   return path.isAbsolute(value) ? value : path.resolve(baseDir, value);
 }
 
-function normalizeAdapter(adapter: Record<string, unknown>): Record<string, unknown> {
-  const config = (adapter.config ?? {}) as Record<string, unknown>;
+function normalizeTransport(transport: Record<string, unknown>): Record<string, unknown> {
+  const config = (transport.config ?? {}) as Record<string, unknown>;
+  const triggers = (transport.triggers ?? {}) as Record<string, unknown>;
 
-  if (adapter.type === "imessage" && adapter.provider === "bluebubbles") {
+  if (transport.channel === "imessage" && transport.provider === "bluebubbles") {
     return {
-      id: adapter.id,
-      type: adapter.type,
-      provider: adapter.provider,
-      enabled: adapter.enabled,
+      id: transport.id,
+      channel: transport.channel,
+      provider: transport.provider,
+      enabled: transport.enabled,
+      triggers: {
+        direct: triggers.direct,
+        group: triggers.group,
+      },
       config: {
         serverUrl: config.server_url,
         password: config.password,
@@ -114,47 +149,108 @@ function normalizeAdapter(adapter: Record<string, unknown>): Record<string, unkn
     };
   }
 
+  if (transport.channel === "telegram" && transport.provider === "bot-api") {
+    return {
+      id: transport.id,
+      channel: transport.channel,
+      provider: transport.provider,
+      enabled: transport.enabled,
+      triggers: {
+        direct: triggers.direct,
+        group: triggers.group,
+      },
+      config: {
+        botToken: config.bot_token,
+        mode: config.mode,
+        pollTimeoutSeconds: config.poll_timeout_seconds,
+        allowedUpdates: config.allowed_updates,
+      },
+    };
+  }
+
   return {
-    id: adapter.id,
-    type: adapter.type,
-    provider: adapter.provider,
-    enabled: adapter.enabled,
+    id: transport.id,
+    channel: transport.channel,
+    provider: transport.provider,
+    enabled: transport.enabled,
+    triggers: {
+      direct: triggers.direct,
+      group: triggers.group,
+    },
     config,
   };
 }
 
-function normalizeRoute(route: Record<string, unknown>): Record<string, unknown> {
-  return {
-    name: route.name,
-    adapterId: route.adapter_id,
-    conversationId: route.conversation_id,
-    workspaceId: route.workspace_id,
-    threadStrategy: route.thread_strategy,
-    mentionRequired: route.mention_required,
-    role: route.role,
-    allowedSenderIds: route.allowed_sender_ids,
-  };
+function normalizeAccessRule(rule: Record<string, unknown>): Record<string, unknown> {
+  switch (rule.kind) {
+    case "conversation":
+      return {
+        kind: rule.kind,
+        transportId: rule.transport_id,
+        conversationId: rule.conversation_id,
+        label: rule.label,
+      };
+    case "sender":
+      return {
+        kind: rule.kind,
+        transportId: rule.transport_id,
+        senderId: rule.sender_id,
+        label: rule.label,
+      };
+    case "direct_messages":
+      return {
+        kind: rule.kind,
+        transportId: rule.transport_id,
+        contactScope: rule.contact_scope,
+        label: rule.label,
+      };
+    case "groups":
+      return {
+        kind: rule.kind,
+        transportId: rule.transport_id,
+        label: rule.label,
+      };
+    default:
+      return rule;
+  }
 }
 
 function validateReferences(config: CodexClawConfig): void {
-  const adapterIds = new Set(config.adapters.map((adapter) => adapter.id));
+  const transportIds = new Set(config.transports.map((transport) => transport.id));
   const workspaceIds = new Set(config.workspaces.map((workspace) => workspace.id));
 
-  for (const route of config.routes) {
-    if (!adapterIds.has(route.adapterId)) {
-      throw new Error(`Route references unknown adapter: ${route.adapterId}`);
-    }
+  if (!workspaceIds.has(config.bot.workspaceId)) {
+    throw new Error(`Bot references unknown workspace: ${config.bot.workspaceId}`);
+  }
 
-    if (!workspaceIds.has(route.workspaceId)) {
-      throw new Error(`Route references unknown workspace: ${route.workspaceId}`);
-    }
-
-    if (route.role === "admin" && (!route.allowedSenderIds || route.allowedSenderIds.length === 0)) {
-      throw new Error(`Admin route must declare at least one allowed sender id: ${route.conversationId}`);
+  for (const rule of [...config.allow, ...config.deny]) {
+    if (!transportIds.has(rule.transportId)) {
+      throw new Error(`Policy rule references unknown transport: ${rule.transportId}`);
     }
   }
 
-  if (!adapterIds.has(config.approvals.targetAdapterId)) {
-    throw new Error(`Approvals target references unknown adapter: ${config.approvals.targetAdapterId}`);
+  for (const admin of config.admins) {
+    if (!transportIds.has(admin.transportId)) {
+      throw new Error(`Admin config references unknown transport: ${admin.transportId}`);
+    }
+  }
+}
+
+function maybeWarnOnTelegramContactScope(config: CodexClawConfig, logger: Logger): void {
+  for (const rule of [...config.allow, ...config.deny]) {
+    if (rule.kind !== "direct_messages" || rule.contactScope === "any") {
+      continue;
+    }
+
+    const transport = config.transports.find((candidate) => candidate.id === rule.transportId);
+    if (transport?.channel !== "telegram") {
+      continue;
+    }
+
+    logger.warn("Telegram direct-message contact scope is unsupported; the rule will never match", {
+      transportId: rule.transportId,
+      ruleLabel: rule.label,
+      contactScope: rule.contactScope,
+    });
   }
 }

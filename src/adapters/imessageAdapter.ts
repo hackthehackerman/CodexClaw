@@ -1,4 +1,4 @@
-import type { IMessageAdapterConfig } from "../config/schema";
+import type { IMessageTransportConfig } from "../config/schema";
 import type { Logger } from "../logger";
 import type { Attachment, ChannelAdapter, MessageHandler, OutboundMessage } from "./base";
 import { BlueBubblesIMessageAdapter } from "./imessage/blueBubblesAdapter";
@@ -7,12 +7,13 @@ export class IMessageAdapter implements ChannelAdapter {
   private readonly delegate: ChannelAdapter;
 
   constructor(
-    config: IMessageAdapterConfig,
+    config: IMessageTransportConfig,
+    botAliases: string[],
     logger: Logger,
   ) {
     switch (config.provider) {
       case "bluebubbles":
-        this.delegate = new BlueBubblesIMessageAdapter(config, logger);
+        this.delegate = new BlueBubblesIMessageAdapter(config, botAliases, logger);
         break;
       default:
         throw new Error(`Unsupported iMessage provider: ${config.provider}`);

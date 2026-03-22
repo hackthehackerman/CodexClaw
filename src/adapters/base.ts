@@ -1,4 +1,4 @@
-export type ChannelName = "imessage" | "whatsapp";
+export type ChannelName = "imessage" | "telegram" | "whatsapp";
 
 export interface Attachment {
   id?: string;
@@ -11,12 +11,17 @@ export interface Attachment {
 export interface InboundMessage {
   adapterId: string;
   channel: ChannelName;
+  messageId?: string;
   conversationId: string;
+  conversationName?: string;
+  conversationType: "direct" | "group";
   senderId: string;
   senderName: string;
+  isKnownContact?: boolean;
   text: string;
   attachments: Attachment[];
   replyToId?: string;
+  addressedToBot?: boolean;
   isFromSelf: boolean;
   isBotEcho?: boolean;
   receivedAt: string;

@@ -5,11 +5,12 @@
 CodexClaw is a thin control layer on top of `codex app-server`.
 
 Codex does the agent work.
-CodexClaw does the messaging, routing, queueing, and approvals.
+CodexClaw does the messaging, policy, queueing, and approvals.
 
-The first target is:
+The first targets are:
 
 - an iMessage-based assistant
+- a Telegram bot
 - in a group chat
 - that only responds when mentioned
 
@@ -26,7 +27,10 @@ The first target is:
 ### CodexClaw owns
 
 - iMessage integration
+- Telegram integration
 - mention detection
+- transport-specific configuration
+- access policy evaluation
 - chat-to-thread mapping
 - per-thread queueing
 - owner approval flow
@@ -38,37 +42,36 @@ The first target is:
 2. One Codex thread has at most one active turn at a time.
 3. CodexClaw uses `personality = "none"` and sends full custom `developer_instructions`.
 4. Risky actions are never approved in the group chat.
-5. The owner approves or denies actions through a private admin iMessage chat.
+5. The owner approves or denies actions through one or more private admin chats.
 
 ## High-Level Architecture
 
 ```mermaid
 flowchart LR
-    Group["iMessage Group Chat"] --> Bridge["iMessage Bridge"]
-    Owner["Owner Admin Chat"] --> Bridge
+    Group["iMessage / Telegram Chat"] --> Bridge["Transport Adapters"]
+    Owner["Owner Admin Chats"] --> Bridge
     Bridge --> Gateway["CodexClaw Gateway"]
-    Gateway --> Router["Session Router"]
+    Gateway --> Router["Policy Router"]
     Router --> Queue["Per-Thread Queue"]
     Queue --> Codex["codex app-server"]
     Codex --> Queue
     Queue --> Gateway
     Gateway --> Bridge
     Gateway --> DB[("SQLite")]
-    Gateway --> Config["codexclaw.toml + prompts/assets"]
+    Gateway --> Config["codexclaw.toml + personality/"]
 ```
 
 ## Core Components
 
-### iMessage Bridge
+### Transport Adapters
 
-The bridge connects CodexClaw to Messages.
+The adapters connect CodexClaw to external chat systems.
 
 Responsibilities:
 
 - receive incoming messages
 - identify chat and sender
-- detect mentions
-- send replies back to iMessage
+- send replies back to the source transport
 - carry private approval prompts to the owner
 
 ## Gateway
@@ -79,6 +82,7 @@ Responsibilities:
 
 - normalize incoming messages
 - load configuration
+- evaluate trigger rules
 - store runtime metadata
 - create runs
 - coordinate approvals
@@ -96,15 +100,23 @@ Responsibilities:
 - consume item and turn events
 - handle server-initiated approval requests
 
-## Session Router
+## Policy Router
 
-The router maps an external conversation to a Codex thread.
+The router decides whether an incoming message is:
 
-Initial mapping:
+- denied
+- a normal user turn
+- an admin/control message
 
-- `imessage chat_guid -> codex_thread_id`
+It evaluates:
 
-This mapping is simple on purpose.
+- transport-specific policy rules
+- explicit allow and deny overrides
+- one or more admin chats
+
+If a message is allowed, CodexClaw then maps:
+
+- `transport + external_chat_id -> codex_thread_id`
 
 ## Per-Thread Queue
 
@@ -142,19 +154,19 @@ For static app behavior:
 
 - bot name
 - mention aliases
+- default access policy
+- explicit allow and deny rules
 - admin chat id
-- allowed chats
 - workspace root
 - default Codex settings
-- prompt file paths
+- soul file path
 
-### 2. prompt and asset files
+### 2. personality directory
 
-For long-lived prompt material:
+For long-lived personality material:
 
-- system prompt
-- approval prompt text
-- avatar or reference image
+- `soul.md`
+- reference assets if the bot needs them
 
 ### 3. SQLite
 
@@ -208,13 +220,13 @@ For mutable runtime state:
 - `status`
 - `decided_at`
 
-## Prompt Strategy
+## Soul Strategy
 
 Each Codex thread should be started with:
 
 - `personality = "none"`
-- full custom `developer_instructions`
-- optional avatar or reference image on the first turn
+- full custom `developer_instructions` built from `personality/soul.md`
+- a note telling Codex where the personality directory lives if it needs reference assets
 
 Suggested behavior:
 
@@ -228,9 +240,9 @@ Suggested behavior:
 ### Message Flow
 
 1. A message arrives in the iMessage group.
-2. The bridge checks whether CodexClaw was mentioned.
+2. The gateway evaluates policy and mention requirements.
 3. The gateway loads or creates the chat session.
-4. The router loads or creates the Codex thread.
+4. CodexClaw loads or creates the Codex thread.
 5. The queue starts the turn when the thread is idle.
 6. Codex runs through App Server.
 7. The gateway takes the final assistant reply.

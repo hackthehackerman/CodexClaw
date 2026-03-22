@@ -1,8 +1,9 @@
 [bot]
-name = "CodexClaw"
-aliases = ["@claw", "claw"]
-developer_instructions_path = "./prompts/system.md"
-avatar_path = "./assets/avatar.png"
+name = "Yanny"
+aliases = ["yanny"]
+soul_path = "./personality/soul.md"
+workspace_id = "main"
+allow_self_messages = false
 
 [codex]
 command = ["codex", "app-server"]
@@ -15,13 +16,61 @@ summary = "concise"
 [storage]
 db_path = "./var/codexclaw.db"
 
-[[adapters]]
-id = "primary-imessage"
-type = "imessage"
-provider = "bluebubbles"
+[web]
 enabled = true
+host = "127.0.0.1"
+port = 4188
 
-[adapters.config]
+[policy]
+default = "deny"
+
+# Start narrow. Uncomment exactly one of these while you get set up:
+#
+# [[allow]]
+# kind = "conversation"
+# transport_id = "primary-telegram"
+# conversation_id = "123456789"
+# label = "my Telegram DM"
+#
+# [[allow]]
+# kind = "conversation"
+# transport_id = "primary-imessage"
+# conversation_id = "any;-;+15555550123"
+# label = "my iMessage DM"
+#
+# After you know the bot works, you can widen access with rules like:
+#
+# [[allow]]
+# kind = "direct_messages"
+# transport_id = "primary-telegram"
+# contact_scope = "any"
+# label = "all Telegram direct messages"
+#
+# [[allow]]
+# kind = "groups"
+# transport_id = "primary-imessage"
+# label = "all allowed iMessage groups"
+
+# Configure at least one admin route if you keep approval_policy = "untrusted".
+# If no admin routes are configured, approvals are auto-declined.
+#
+# [[admins]]
+# transport_id = "primary-telegram"
+# conversation_id = "123456789"
+# allowed_sender_ids = ["123456789"]
+# command_format = "strict"
+
+[[transports]]
+id = "primary-imessage"
+channel = "imessage"
+provider = "bluebubbles"
+enabled = false
+
+[transports.triggers]
+direct = "none"
+group = "addressed"
+
+[transports.config]
 server_url = "http://127.0.0.1:1234"
 password = "replace-with-bluebubbles-server-password"
 webhook_listen_host = "127.0.0.1"
@@ -30,31 +79,23 @@ webhook_path = "/webhooks/bluebubbles"
 webhook_public_url = "http://127.0.0.1:4101/webhooks/bluebubbles"
 webhook_token = "replace-with-random-token"
 auto_register_webhook = true
-webhook_events = ["new-message"]
+webhook_events = ["new-message", "updated-message"]
 
-# Routes are the conversation allowlist.
-# CodexClaw ignores any inbound message from a chat that is not listed here.
-[[routes]]
-name = "allowed group chat"
-adapter_id = "primary-imessage"
-conversation_id = "any;+;GROUP_CHAT_GUID"
-workspace_id = "main"
-mention_required = true
-role = "user"
+[[transports]]
+id = "primary-telegram"
+channel = "telegram"
+provider = "bot-api"
+enabled = false
 
-[[routes]]
-name = "operator approvals"
-adapter_id = "primary-imessage"
-conversation_id = "iMessage;-;ADMIN_CHAT_GUID"
-workspace_id = "main"
-mention_required = false
-role = "admin"
-allowed_sender_ids = ["OWNER_HANDLE_OR_EMAIL"]
+[transports.triggers]
+direct = "none"
+group = "addressed"
 
-[approvals]
-target_adapter_id = "primary-imessage"
-target_conversation_id = "iMessage;-;ADMIN_CHAT_GUID"
-command_format = "strict"
+[transports.config]
+bot_token = "replace-with-telegram-bot-token"
+mode = "polling"
+poll_timeout_seconds = 30
+allowed_updates = ["message"]
 
 [[workspaces]]
 id = "main"

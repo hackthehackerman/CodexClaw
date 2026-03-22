@@ -1,23 +1,35 @@
 {
   "name": "codexclaw",
   "version": "0.1.0",
-  "private": true,
   "description": "Thin orchestration layer on top of codex app-server.",
+  "bin": {
+    "codexclaw": "dist/cli.js"
+  },
+  "files": [
+    "dist/**/*",
+    "templates/**/*",
+    "README.md",
+    "docs/quickstart.md",
+    "codexclaw.example.toml"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "start": "node dist/cli.js start",
+    "test": "tsc -p tsconfig.test.json && node dist-test/tests/run.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepack": "npm run build"
   },
   "engines": {
-    "node": ">=14.17"
+    "node": ">=18"
   },
   "dependencies": {
     "@iarna/toml": "^2.2.5",
+    "better-sqlite3": "^12.8.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.14.8",
     "typescript": "^5.5.4"
   }
 }
-

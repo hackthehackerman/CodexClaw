@@ -5,7 +5,7 @@ import path from "path";
 import { URL } from "url";
 import { promises as fs } from "fs";
 import { z } from "zod";
-import type { BlueBubblesIMessageAdapterConfig } from "../../config/schema";
+import type { BlueBubblesIMessageTransportConfig } from "../../config/schema";
 import type { Logger } from "../../logger";
 import type { Attachment, ChannelAdapter, InboundMessage, MessageHandler, OutboundMessage } from "../base";
 
@@ -56,6 +56,14 @@ interface RecentOutgoingMessage {
   sentAt: number;
 }
 
+interface BlueBubblesContactRecord {
+  displayName?: string;
+  firstName?: string;
+  lastName?: string;
+  phoneNumbers?: Array<{ address?: string | null }>;
+  emails?: Array<{ address?: string | null }>;
+}
+
 export class BlueBubblesIMessageAdapter implements ChannelAdapter {
   readonly channel = "imessage" as const;
   readonly id: string;
@@ -64,16 +72,26 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
   private server?: http.Server;
   private nextTempGuid = 1;
   private readonly recentOutgoingMessages: RecentOutgoingMessage[] = [];
+  private readonly knownContactAddresses = new Set<string>();
+  private readonly contactDisplayNames = new Map<string, string>();
+  private readonly normalizedBotAliases: string[];
 
   constructor(
-    private readonly config: BlueBubblesIMessageAdapterConfig,
+    private readonly config: BlueBubblesIMessageTransportConfig,
+    botAliases: string[],
     private readonly logger: Logger,
   ) {
     this.id = config.id;
+    this.normalizedBotAliases = Array.from(new Set(
+      botAliases
+        .map((alias) => normalizeBotAlias(alias))
+        .filter((alias): alias is string => Boolean(alias)),
+    ));
   }
 
   async start(handler: MessageHandler): Promise<void> {
     this.handler = handler;
+    await this.loadKnownContacts();
     await this.startWebhookServer();
 
     if (this.config.config.autoRegisterWebhook) {
@@ -276,6 +294,21 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
       return;
     }
 
+    this.logger.info("BlueBubbles inbound event received", {
+      adapterId: this.id,
+      eventType: envelope.type,
+      messageId: message.messageId,
+      conversationId: message.conversationId,
+      conversationName: message.conversationName,
+      conversationType: message.conversationType,
+      senderId: message.senderId,
+      senderName: message.senderName,
+      receivedAt: message.receivedAt,
+      eventAgeMs: diffMs(message.receivedAt),
+      attachmentCount: message.attachments.length,
+      textPreview: previewText(message.text),
+    });
+
     await this.handler(message);
   }
 
@@ -290,23 +323,34 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
       return null;
     }
 
-    const senderId = envelope.data.handle?.address ?? (envelope.data.isFromMe ? "self" : "unknown");
-    const senderName = envelope.data.handle?.address ?? chat.displayName ?? senderId;
+    const conversationType = classifyConversationType(chat.guid);
+    const rawSenderId = envelope.data.handle?.address ?? (envelope.data.isFromMe ? "self" : "unknown");
+    const normalizedSenderId = normalizeContactAddress(rawSenderId) ?? rawSenderId;
+    const senderName = this.resolveSenderName(normalizedSenderId, rawSenderId, chat.displayName);
     const attachments = this.normalizeAttachments(envelope.data.attachments ?? []);
     const isBotEcho = Boolean(envelope.data.isFromMe) && this.matchesRecentOutgoingMessage({
       conversationId: chat.guid,
       text: envelope.data.text ?? envelope.data.subject ?? "",
       attachmentNames: attachments.map((attachment) => attachment.name ?? ""),
     });
+    const text = envelope.data.text ?? envelope.data.subject ?? "";
+    const addressedToBot = messageTagsBot(text, this.normalizedBotAliases);
 
     return {
       adapterId: this.id,
       channel: this.channel,
+      messageId: envelope.data.guid ?? undefined,
       conversationId: chat.guid,
-      senderId,
+      conversationName: chat.displayName ?? undefined,
+      conversationType,
+      senderId: normalizedSenderId,
       senderName,
-      text: envelope.data.text ?? envelope.data.subject ?? "",
+      isKnownContact: normalizedSenderId === "self"
+        ? true
+        : this.knownContactAddresses.has(normalizedSenderId),
+      text,
       attachments,
+      addressedToBot,
       isFromSelf: envelope.data.isFromMe ?? false,
       isBotEcho,
       receivedAt: toIsoTimestamp(envelope.data.dateCreated),
@@ -332,6 +376,8 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
   }
 
   private async registerWebhook(): Promise<void> {
+    await this.syncWebhookRegistrations();
+
     const response = await this.requestJson<BlueBubblesWebhookRegistration>(
       "POST",
       "/api/v1/webhook",
@@ -346,6 +392,69 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
       webhookId: response.data?.id,
       events: response.data?.events ?? this.config.config.webhookEvents,
     });
+  }
+
+  private async syncWebhookRegistrations(): Promise<void> {
+    const response = await this.requestJson<BlueBubblesWebhookRegistration[]>("GET", "/api/v1/webhook");
+    const existing = (response.data ?? []).filter((webhook) => webhook.url === this.registrationUrl());
+
+    for (const webhook of existing) {
+      if (sameStringArray(webhook.events ?? [], this.config.config.webhookEvents)) {
+        continue;
+      }
+
+      await this.requestJson("DELETE", `/api/v1/webhook/${webhook.id}`);
+      this.logger.info("Deleted stale BlueBubbles webhook registration", {
+        adapterId: this.id,
+        webhookId: webhook.id,
+        previousEvents: webhook.events ?? [],
+      });
+    }
+  }
+
+  private async loadKnownContacts(): Promise<void> {
+    try {
+      const response = await this.requestJson<BlueBubblesContactRecord[]>("GET", "/api/v1/contact");
+      const contacts = response.data ?? [];
+      this.knownContactAddresses.clear();
+      this.contactDisplayNames.clear();
+
+      for (const contact of contacts) {
+        const displayName = formatContactDisplayName(contact);
+
+        for (const address of [
+          ...(contact.phoneNumbers ?? []).map((phone) => phone.address ?? undefined),
+          ...(contact.emails ?? []).map((email) => email.address ?? undefined),
+        ]) {
+          const normalized = normalizeContactAddress(address);
+          if (!normalized) {
+            continue;
+          }
+
+          this.knownContactAddresses.add(normalized);
+          if (displayName) {
+            this.contactDisplayNames.set(normalized, displayName);
+          }
+        }
+      }
+
+      this.logger.info("Loaded BlueBubbles contacts", {
+        adapterId: this.id,
+        count: this.knownContactAddresses.size,
+      });
+    } catch (error) {
+      this.logger.warn("Failed to load BlueBubbles contacts", {
+        adapterId: this.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private resolveSenderName(senderId: string, rawSenderId: string, chatDisplayName?: string | null): string {
+    return this.contactDisplayNames.get(senderId)
+      ?? chatDisplayName
+      ?? rawSenderId
+      ?? senderId;
   }
 
   private registrationUrl(): string {
@@ -399,7 +508,7 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
   }
 
   private async requestJson<T>(
-    method: "POST" | "GET",
+    method: "POST" | "GET" | "DELETE",
     endpointPath: string,
     body?: Record<string, unknown>,
   ): Promise<BlueBubblesSuccessResponse<T>> {
@@ -623,6 +732,58 @@ function normalizeBaseUrl(value: string): string {
   return value.endsWith("/") ? value : `${value}/`;
 }
 
+function classifyConversationType(conversationId: string): "direct" | "group" {
+  if (conversationId.includes(";+;")) {
+    return "group";
+  }
+
+  return "direct";
+}
+
+function formatContactDisplayName(contact: BlueBubblesContactRecord): string | undefined {
+  if (contact.displayName?.trim()) {
+    return contact.displayName.trim();
+  }
+
+  const name = [contact.firstName, contact.lastName]
+    .map((value) => value?.trim())
+    .filter((value): value is string => Boolean(value))
+    .join(" ")
+    .trim();
+
+  return name || undefined;
+}
+
+function normalizeContactAddress(value?: string | null): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  if (trimmed.includes("@")) {
+    return trimmed.toLowerCase();
+  }
+
+  const digits = trimmed.replace(/\D+/g, "");
+  if (digits.length === 0) {
+    return trimmed.toLowerCase();
+  }
+
+  if (trimmed.startsWith("+")) {
+    return `+${digits}`;
+  }
+
+  if (digits.length === 10) {
+    return `+1${digits}`;
+  }
+
+  return `+${digits}`;
+}
+
 function toIsoTimestamp(dateCreated?: number | null): string {
   return dateCreated ? new Date(dateCreated).toISOString() : new Date().toISOString();
 }
@@ -708,6 +869,48 @@ function escapeHeaderValue(value: string): string {
   return value.replace(/"/g, "_");
 }
 
+function normalizeBotAlias(value: string): string | undefined {
+  const normalized = value.trim().replace(/^@+/, "").toLowerCase();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function messageTagsBot(text: string, aliases: string[]): boolean {
+  const normalizedText = text.trim().toLowerCase();
+  if (!normalizedText || aliases.length === 0) {
+    return false;
+  }
+
+  return aliases.some((alias) => containsExplicitTag(normalizedText, alias));
+}
+
+function containsExplicitTag(text: string, token: string): boolean {
+  let searchIndex = 0;
+  const taggedToken = `@${token}`;
+
+  while (searchIndex < text.length) {
+    const matchIndex = text.indexOf(taggedToken, searchIndex);
+    if (matchIndex === -1) {
+      return false;
+    }
+
+    const before = matchIndex === 0 ? "" : text.charAt(matchIndex - 1);
+    const afterIndex = matchIndex + taggedToken.length;
+    const after = afterIndex >= text.length ? "" : text.charAt(afterIndex);
+
+    if (isAddressBoundary(before) && isAddressBoundary(after)) {
+      return true;
+    }
+
+    searchIndex = matchIndex + taggedToken.length;
+  }
+
+  return false;
+}
+
+function isAddressBoundary(value: string): boolean {
+  return value.length === 0 || /[\s:,.!?@'"\-()[\]{}]/.test(value);
+}
+
 function isAudioAttachment(attachment: Attachment): boolean {
   return attachment.type === "audio" || attachment.mimeType?.startsWith("audio/") === true;
 }
@@ -729,4 +932,33 @@ function arraysEqual(left: string[], right: string[]): boolean {
   }
 
   return left.every((value, index) => value === right[index]);
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+  return arraysEqual(
+    [...left].sort((a, b) => a.localeCompare(b)),
+    [...right].sort((a, b) => a.localeCompare(b)),
+  );
+}
+
+function diffMs(start: string | undefined, end: number = Date.now()): number | undefined {
+  if (!start) {
+    return undefined;
+  }
+
+  const startTime = Date.parse(start);
+  if (Number.isNaN(startTime)) {
+    return undefined;
+  }
+
+  return Math.max(0, end - startTime);
+}
+
+function previewText(value: string, maxLength = 80): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxLength - 1)}…`;
 }

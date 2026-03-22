@@ -1,6 +1,10 @@
 node_modules/
 dist/
+dist-test/
 .DS_Store
 codexclaw.toml
 output/
 tmp/
+var/
+prompts/
+personality/

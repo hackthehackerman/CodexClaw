@@ -7,8 +7,7 @@ import type { Logger } from "../logger";
 
 export interface ThreadInitContext {
   workspaceCwd: string;
-  developerInstructionsPath: string;
-  avatarPath?: string;
+  soulPath: string;
 }
 
 export interface TurnRequest {
@@ -27,6 +26,16 @@ export interface TurnResult {
   turnId: string;
   finalResponse: string;
   attachments: Attachment[];
+}
+
+export interface TurnStartPayload extends Record<string, unknown> {
+  threadId: string;
+  input: Array<Record<string, unknown>>;
+  cwd: string;
+  model?: string;
+  effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  summary: string;
+  personality: "none";
 }
 
 export interface ApprovalRequest {
@@ -109,7 +118,7 @@ export class AppServerClient {
   private readonly pendingRequests = new Map<string, PendingRequest>();
   private readonly activeTurns = new Map<string, ActiveTurnState>();
   private readonly pendingApprovals = new Map<string, PendingApprovalState>();
-  private readonly pendingAvatarByThreadId = new Map<string, string>();
+  private readonly loadedThreadIds = new Set<string>();
   private mediaSkillsPromise?: Promise<SkillDefinition[]>;
 
   private child?: ChildProcessWithoutNullStreams;
@@ -134,32 +143,24 @@ export class AppServerClient {
     this.approvalHandler = handler;
   }
 
+  applyRuntimeConfig(config: Pick<AppServerClientOptions, "approvalPolicy" | "sandbox" | "model" | "effort" | "summary">): void {
+    this.options.approvalPolicy = config.approvalPolicy;
+    this.options.sandbox = config.sandbox;
+    this.options.model = config.model;
+    this.options.effort = config.effort;
+    this.options.summary = config.summary;
+  }
+
   async createThread(context: ThreadInitContext): Promise<string> {
     await this.start();
 
-    const developerInstructions = await fs.readFile(context.developerInstructionsPath, "utf8");
-    const result = await this.sendRequest<ThreadStartResult>("thread/start", {
-      cwd: context.workspaceCwd,
-      approvalPolicy: this.options.approvalPolicy,
-      approvalsReviewer: "user",
-      sandbox: this.options.sandbox,
-      model: this.options.model,
-      developerInstructions,
-      personality: "none",
-      serviceName: "codexclaw",
-      experimentalRawEvents: false,
-      persistExtendedHistory: true,
-    });
+    const result = await this.sendRequest<ThreadStartResult>(
+      "thread/start",
+      await this.buildThreadParams(context),
+    );
 
     const threadId = result.thread.id;
-
-    if (context.avatarPath && await fileExists(context.avatarPath)) {
-      this.pendingAvatarByThreadId.set(threadId, context.avatarPath);
-    } else if (context.avatarPath) {
-      this.logger.warn("Avatar path is configured but missing; skipping seed image", {
-        avatarPath: context.avatarPath,
-      });
-    }
+    this.loadedThreadIds.add(threadId);
 
     this.logger.info("Created Codex thread", {
       threadId,
@@ -169,25 +170,35 @@ export class AppServerClient {
     return threadId;
   }
 
-  async runTurn(request: TurnRequest): Promise<TurnResult> {
+  async resumeThread(threadId: string, context: ThreadInitContext): Promise<string> {
     await this.start();
 
+    if (this.loadedThreadIds.has(threadId)) {
+      return threadId;
+    }
+
+    const result = await this.sendRequest<ThreadStartResult>(
+      "thread/resume",
+      {
+        threadId,
+        ...(await this.buildThreadParams(context)),
+      },
+    );
+
+    const resumedThreadId = result.thread.id;
+    this.loadedThreadIds.add(resumedThreadId);
+
+    this.logger.info("Resumed Codex thread", {
+      threadId: resumedThreadId,
+      workspaceCwd: context.workspaceCwd,
+    });
+
+    return resumedThreadId;
+  }
+
+  async buildTurnStartPayload(request: TurnRequest): Promise<TurnStartPayload> {
     const input: Array<Record<string, unknown>> = [];
     const mediaSkills = await this.getAvailableMediaSkills();
-    const avatarPath = this.pendingAvatarByThreadId.get(request.threadId);
-
-    if (avatarPath) {
-      input.push({
-        type: "text",
-        text: "Reference image: this is what CodexClaw looks like. Use it as the bot's visual identity reference.",
-        text_elements: [],
-      });
-      input.push({
-        type: "localImage",
-        path: avatarPath,
-      });
-      this.pendingAvatarByThreadId.delete(request.threadId);
-    }
 
     input.push({
       type: "text",
@@ -256,7 +267,7 @@ export class AppServerClient {
       text_elements: [],
     });
 
-    const started = await this.sendRequest<TurnStartResult>("turn/start", {
+    return {
       threadId: request.threadId,
       input,
       cwd: request.workspaceCwd,
@@ -264,7 +275,15 @@ export class AppServerClient {
       effort: this.options.effort,
       summary: this.options.summary,
       personality: "none",
-    });
+    };
+  }
+
+  async runTurn(request: TurnRequest, preparedPayload?: TurnStartPayload): Promise<TurnResult> {
+    await this.start();
+
+    const payload = preparedPayload ?? await this.buildTurnStartPayload(request);
+
+    const started = await this.sendRequest<TurnStartResult>("turn/start", payload);
 
     const turnId = started.turn.id;
 
@@ -636,6 +655,7 @@ export class AppServerClient {
     this.activeTurns.clear();
 
     this.pendingApprovals.clear();
+    this.loadedThreadIds.clear();
     this.startPromise = undefined;
 
     if (this.child && !this.child.killed) {
@@ -649,6 +669,23 @@ export class AppServerClient {
     }
 
     return await this.mediaSkillsPromise;
+  }
+
+  private async buildThreadParams(context: ThreadInitContext): Promise<Record<string, unknown>> {
+    const developerInstructions = await buildDeveloperInstructions(context.soulPath);
+
+    return {
+      cwd: context.workspaceCwd,
+      approvalPolicy: this.options.approvalPolicy,
+      approvalsReviewer: "user",
+      sandbox: this.options.sandbox,
+      model: this.options.model,
+      developerInstructions,
+      personality: "none",
+      serviceName: "codexclaw",
+      experimentalRawEvents: false,
+      persistExtendedHistory: true,
+    };
   }
 }
 
@@ -814,6 +851,19 @@ async function discoverMediaSkills(): Promise<SkillDefinition[]> {
   }
 
   return found;
+}
+
+async function buildDeveloperInstructions(soulPath: string): Promise<string> {
+  const soul = await fs.readFile(soulPath, "utf8");
+  const personalityDir = path.dirname(soulPath);
+
+  return [
+    soul.trim(),
+    "",
+    "[CodexClaw Personality]",
+    `The personality directory for this bot is: ${personalityDir}`,
+    "If you need reference assets for this bot's identity, style, or look, check that directory.",
+  ].join("\n");
 }
 
 function buildChatContext(request: TurnRequest): string {

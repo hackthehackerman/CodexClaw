@@ -1,46 +1,84 @@
 import type { InboundMessage } from "../adapters/base";
-import type { RouteConfig, WorkspaceConfig } from "../config/schema";
+import type { AccessRule, WorkspaceConfig } from "../config/schema";
 import type { Logger } from "../logger";
 import type { ChatSession, StateStore } from "../storage/stateStore";
 
 export interface RouteContext {
-  route: RouteConfig;
+  kind: "user" | "admin";
   workspace: WorkspaceConfig;
+  label?: string;
+  allowedSenderIds?: string[];
+}
+
+export interface SessionRouterOptions {
+  workspaceId: string;
+  policyDefault: "allow" | "deny";
+  allowRules: AccessRule[];
+  denyRules: AccessRule[];
+  admins: Array<{
+    transportId: string;
+    conversationId: string;
+    allowedSenderIds: string[];
+  }>;
 }
 
 export class SessionRouter {
-  private readonly routesByKey = new Map<string, RouteConfig>();
   private readonly workspacesById = new Map<string, WorkspaceConfig>();
+  private readonly workspace: WorkspaceConfig;
 
   constructor(
-    routes: RouteConfig[],
+    private readonly options: SessionRouterOptions,
     workspaces: WorkspaceConfig[],
     private readonly store: StateStore,
     private readonly logger: Logger,
   ) {
-    for (const route of routes) {
-      this.routesByKey.set(this.routeKey(route.adapterId, route.conversationId), route);
-    }
-
     for (const workspace of workspaces) {
       this.workspacesById.set(workspace.id, workspace);
     }
+
+    const workspace = this.workspacesById.get(options.workspaceId);
+    if (!workspace) {
+      throw new Error(`Bot references missing workspace: ${options.workspaceId}`);
+    }
+
+    this.workspace = workspace;
   }
 
   match(message: InboundMessage): RouteContext | undefined {
-    const route = this.routesByKey.get(this.routeKey(message.adapterId, message.conversationId));
+    if (this.isAdminConversation(message)) {
+      const admin = this.options.admins.find((candidate) =>
+        candidate.transportId === message.adapterId && candidate.conversationId === message.conversationId,
+      );
 
-    if (!route) {
+      return {
+        kind: "admin",
+        workspace: this.workspace,
+        label: "admin",
+        allowedSenderIds: admin?.allowedSenderIds,
+      };
+    }
+
+    if (this.options.denyRules.some((rule) => matchesAccessRule(rule, message))) {
       return undefined;
     }
 
-    const workspace = this.workspacesById.get(route.workspaceId);
-
-    if (!workspace) {
-      throw new Error(`Route references missing workspace: ${route.workspaceId}`);
+    const matchedAllowRule = this.options.allowRules.find((rule) => matchesAccessRule(rule, message));
+    if (matchedAllowRule) {
+      return {
+        kind: "user",
+        workspace: this.workspace,
+        label: matchedAllowRule.label,
+      };
     }
 
-    return { route, workspace };
+    if (this.options.policyDefault === "allow") {
+      return {
+        kind: "user",
+        workspace: this.workspace,
+      };
+    }
+
+    return undefined;
   }
 
   async getOrCreateChatSession(message: InboundMessage): Promise<ChatSession> {
@@ -56,7 +94,7 @@ export class SessionRouter {
       adapterId: message.adapterId,
       channel: message.channel,
       externalChatId: message.conversationId,
-      displayName: message.senderName,
+      displayName: message.conversationName ?? message.senderName,
       createdAt: now,
       updatedAt: now,
     };
@@ -78,8 +116,38 @@ export class SessionRouter {
     return created;
   }
 
-  private routeKey(adapterId: string, conversationId: string): string {
-    return `${adapterId}:${conversationId}`;
+  private isAdminConversation(message: InboundMessage): boolean {
+    return this.options.admins.some((admin) =>
+      message.adapterId === admin.transportId && message.conversationId === admin.conversationId,
+    );
   }
 }
 
+function matchesAccessRule(rule: AccessRule, message: InboundMessage): boolean {
+  if (rule.transportId !== message.adapterId) {
+    return false;
+  }
+
+  switch (rule.kind) {
+    case "conversation":
+      return rule.conversationId === message.conversationId;
+    case "sender":
+      return rule.senderId === message.senderId;
+    case "direct_messages":
+      if (message.conversationType !== "direct") {
+        return false;
+      }
+
+      if (rule.contactScope === "any") {
+        return true;
+      }
+
+      if (rule.contactScope === "known") {
+        return message.isKnownContact === true;
+      }
+
+      return message.isKnownContact === false;
+    case "groups":
+      return message.conversationType === "group";
+  }
+}
