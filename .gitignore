@@ -2,7 +2,7 @@ node_modules/
 dist/
 dist-test/
 .DS_Store
-codexclaw.toml
+/codexclaw.toml
 output/
 tmp/
 var/

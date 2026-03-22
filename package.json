@@ -17,7 +17,8 @@
     "start": "node dist/cli.js start",
     "test": "tsc -p tsconfig.test.json && node dist-test/tests/run.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "verify:v0": "node scripts/verify-v0.mjs"
   },
   "engines": {
     "node": ">=18"

@@ -48,6 +48,13 @@ codexclaw doctor
 codexclaw start
 ```
 
+Fastest safe presets:
+
+```bash
+codexclaw init --telegram-chat 123456789 --telegram-bot-token "$TELEGRAM_BOT_TOKEN"
+codexclaw init --imessage-chat 'any;-;+15555550123' --bluebubbles-password "$BLUEBUBBLES_PASSWORD" --imessage-admin-sender '+15555550123'
+```
+
 `codexclaw init` creates:
 - `codexclaw.toml`
 - `personality/soul.md`
@@ -77,6 +84,8 @@ codexclaw init
 codexclaw doctor
 codexclaw start
 ```
+
+`codexclaw doctor --offline` skips live Telegram and BlueBubbles reachability checks. It is useful for template validation and release smoke tests.
 
 You can also pass an explicit config path:
 

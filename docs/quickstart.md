@@ -32,6 +32,19 @@ Default trigger behavior is:
 
 ### Telegram
 
+Fastest “only me” path:
+
+```bash
+codexclaw init --telegram-chat 123456789 --telegram-bot-token "$TELEGRAM_BOT_TOKEN"
+```
+
+That generates:
+- an enabled Telegram transport
+- one narrow allow rule for your DM
+- one matching admin route for approvals
+
+Manual path:
+
 1. Create a bot with `@BotFather`
 2. Copy the bot token
 3. In `codexclaw.toml`, set:
@@ -58,6 +71,19 @@ command_format = "strict"
 ```
 
 ### iMessage / BlueBubbles
+
+Fastest “only me” path:
+
+```bash
+codexclaw init --imessage-chat 'any;-;+15555550123' --bluebubbles-password "$BLUEBUBBLES_PASSWORD" --imessage-admin-sender '+15555550123'
+```
+
+That generates:
+- an enabled iMessage transport
+- one narrow allow rule for that conversation
+- one matching admin route if you pass `--imessage-admin-sender`
+
+Manual path:
 
 1. Install and configure BlueBubbles Server on the Mac that runs Messages
 2. Confirm BlueBubbles local API works
@@ -102,6 +128,12 @@ Widen later after the bot is stable.
 
 ```bash
 codexclaw doctor
+```
+
+or, if you only want config validation without network checks:
+
+```bash
+codexclaw doctor --offline
 ```
 
 It checks:

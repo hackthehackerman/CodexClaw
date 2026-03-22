@@ -24,6 +24,14 @@ interface DoctorCheck {
   detail: string;
 }
 
+interface InitPreset {
+  telegramChatId?: string;
+  telegramBotToken?: string;
+  imessageConversationId?: string;
+  blueBubblesPassword?: string;
+  imessageAdminSenderId?: string;
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
 
@@ -66,16 +74,19 @@ async function runInit(parsed: ParsedArgs): Promise<void> {
   await fs.mkdir(personalityDir, { recursive: true });
   await fs.mkdir(varDir, { recursive: true });
 
-  const packageRoot = path.resolve(__dirname, "..");
+  const packageRoot = await resolvePackageRoot();
   const configTemplatePath = path.join(packageRoot, "templates", "codexclaw.toml");
   const soulTemplatePath = path.join(packageRoot, "templates", "soul.md");
 
   const configTemplate = await fs.readFile(configTemplatePath, "utf8");
   const soulTemplate = await fs.readFile(soulTemplatePath, "utf8");
+  const preset = parseInitPreset(parsed);
 
-  const renderedConfig = configTemplate
-    .replace(/__WORKSPACE_CWD__/g, escapeTomlString(process.cwd()))
-    .replace(/__GENERATED_WEBHOOK_TOKEN__/g, randomBytes(16).toString("hex"));
+  const renderedConfig = renderInitConfig(configTemplate, {
+    workspaceCwd: process.cwd(),
+    webhookToken: randomBytes(16).toString("hex"),
+    preset,
+  });
 
   await fs.writeFile(configPath, renderedConfig, "utf8");
   await fs.writeFile(soulPath, soulTemplate, "utf8");
@@ -83,18 +94,14 @@ async function runInit(parsed: ParsedArgs): Promise<void> {
   console.log(`Created ${configPath}`);
   console.log(`Created ${soulPath}`);
   console.log("");
-  console.log("Next steps:");
-  console.log(`1. Edit ${configPath} and enable one transport.`);
-  console.log("2. Add one narrow allow rule so only you can message Yanny.");
-  console.log("3. If you keep approval_policy = \"untrusted\", add an admin route.");
-  console.log("4. Run: codexclaw doctor");
-  console.log("5. Run: codexclaw start");
+  printInitNextSteps(configPath, preset);
 }
 
 async function runDoctor(parsed: ParsedArgs): Promise<void> {
   const logger = createLogger("codexclaw:doctor");
   const explicitConfig = readStringFlag(parsed, "config") ?? parsed.positionals[0];
   const configPath = resolveConfigPath(explicitConfig);
+  const offline = readBooleanFlag(parsed, "offline");
   const checks: DoctorCheck[] = [];
 
   let config: CodexClawConfig;
@@ -195,12 +202,12 @@ async function runDoctor(parsed: ParsedArgs): Promise<void> {
 
   for (const transport of enabledTransports) {
     if (transport.channel === "telegram" && transport.provider === "bot-api") {
-      checks.push(await checkTelegramTransport(transport));
+      checks.push(await checkTelegramTransport(transport, offline));
       continue;
     }
 
     if (transport.channel === "imessage" && transport.provider === "bluebubbles") {
-      checks.push(await checkBlueBubblesTransport(transport));
+      checks.push(await checkBlueBubblesTransport(transport, offline));
       continue;
     }
 
@@ -239,6 +246,14 @@ function printHelp(): void {
   console.log("Options:");
   console.log("  --config <path>   Use an explicit config path");
   console.log("  --force           Overwrite files during init");
+  console.log("  --offline         Skip live transport checks during doctor");
+  console.log("");
+  console.log("Init presets:");
+  console.log("  --telegram-chat <chat-id>              Enable Telegram and allow only that DM");
+  console.log("  --telegram-bot-token <token>           Fill the Telegram bot token");
+  console.log("  --imessage-chat <conversation-id>      Enable iMessage and allow only that chat");
+  console.log("  --bluebubbles-password <password>      Fill the BlueBubbles server password");
+  console.log("  --imessage-admin-sender <sender-id>    Reuse the iMessage chat for approvals from that sender");
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -325,8 +340,23 @@ async function pathExists(targetPath: string): Promise<boolean> {
   }
 }
 
+async function resolvePackageRoot(): Promise<string> {
+  const candidates = [
+    path.resolve(__dirname, ".."),
+    path.resolve(__dirname, "..", ".."),
+  ];
+
+  for (const candidate of candidates) {
+    if (await pathExists(path.join(candidate, "templates", "codexclaw.toml"))) {
+      return candidate;
+    }
+  }
+
+  throw new Error("Could not find bundled templates directory");
+}
+
 function escapeTomlString(value: string): string {
-  return value.replace(/\\/g, "\\\\");
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 function printDoctorResults(checks: DoctorCheck[]): void {
@@ -378,12 +408,23 @@ async function checkCodexCommand(command: string[]): Promise<DoctorCheck> {
   });
 }
 
-async function checkTelegramTransport(transport: TelegramTransportConfig): Promise<DoctorCheck> {
+async function checkTelegramTransport(
+  transport: TelegramTransportConfig,
+  offline: boolean,
+): Promise<DoctorCheck> {
   if (looksLikePlaceholder(transport.config.botToken)) {
     return {
       status: "fail",
       label: transport.id,
       detail: "Telegram bot token is still a placeholder",
+    };
+  }
+
+  if (offline) {
+    return {
+      status: "pass",
+      label: transport.id,
+      detail: "Offline mode skipped Telegram reachability check",
     };
   }
 
@@ -416,12 +457,23 @@ async function checkTelegramTransport(transport: TelegramTransportConfig): Promi
   }
 }
 
-async function checkBlueBubblesTransport(transport: BlueBubblesIMessageTransportConfig): Promise<DoctorCheck> {
+async function checkBlueBubblesTransport(
+  transport: BlueBubblesIMessageTransportConfig,
+  offline: boolean,
+): Promise<DoctorCheck> {
   if (looksLikePlaceholder(transport.config.password)) {
     return {
       status: "fail",
       label: transport.id,
       detail: "BlueBubbles password is still a placeholder",
+    };
+  }
+
+  if (offline) {
+    return {
+      status: "pass",
+      label: transport.id,
+      detail: "Offline mode skipped BlueBubbles reachability check",
     };
   }
 
@@ -446,19 +498,31 @@ async function checkBlueBubblesTransport(transport: BlueBubblesIMessageTransport
 function findPlaceholderWarnings(rawText: string, config: CodexClawConfig): DoctorCheck[] {
   const checks: DoctorCheck[] = [];
 
-  if (rawText.includes("replace-with-")) {
-    checks.push({
-      status: "warn",
-      label: "placeholders",
-      detail: "Config still contains replace-with-* placeholder values",
-    });
-  }
+  const enabledTransportHasPlaceholder = config.transports.some((transport) => {
+    if (!transport.enabled) {
+      return false;
+    }
 
-  if (rawText.includes("GROUP_CHAT_GUID") || rawText.includes("ADMIN_CHAT_GUID") || rawText.includes("OWNER_HANDLE_OR_EMAIL")) {
+    if (transport.channel === "telegram" && transport.provider === "bot-api") {
+      return looksLikePlaceholder(transport.config.botToken);
+    }
+
+    if (transport.channel === "imessage" && transport.provider === "bluebubbles") {
+      return looksLikePlaceholder(transport.config.password);
+    }
+
+    return false;
+  });
+
+  const adminHasPlaceholder = config.admins.some((admin) =>
+    looksLikePlaceholder(admin.conversationId) || admin.allowedSenderIds.some(looksLikePlaceholder),
+  );
+
+  if (enabledTransportHasPlaceholder || adminHasPlaceholder) {
     checks.push({
       status: "warn",
       label: "placeholders",
-      detail: "Config still contains example conversation or admin placeholder values",
+      detail: "Enabled transports or admin routes still contain placeholder values",
     });
   }
 
@@ -475,6 +539,140 @@ function findPlaceholderWarnings(rawText: string, config: CodexClawConfig): Doct
 
 function looksLikePlaceholder(value: string): boolean {
   return value.includes("replace-with") || value.includes("YOUR_") || value.includes("ADMIN_CHAT_GUID");
+}
+
+function parseInitPreset(parsed: ParsedArgs): InitPreset {
+  return {
+    telegramChatId: readStringFlag(parsed, "telegram-chat"),
+    telegramBotToken: readStringFlag(parsed, "telegram-bot-token"),
+    imessageConversationId: readStringFlag(parsed, "imessage-chat"),
+    blueBubblesPassword: readStringFlag(parsed, "bluebubbles-password"),
+    imessageAdminSenderId: readStringFlag(parsed, "imessage-admin-sender"),
+  };
+}
+
+function renderInitConfig(
+  template: string,
+  options: {
+    workspaceCwd: string;
+    webhookToken: string;
+    preset: InitPreset;
+  },
+): string {
+  const allowBlocks = buildInitAllowBlocks(options.preset);
+  const adminBlocks = buildInitAdminBlocks(options.preset);
+  const telegramEnabled = Boolean(options.preset.telegramChatId || options.preset.telegramBotToken);
+  const imessageEnabled = Boolean(
+    options.preset.imessageConversationId ||
+    options.preset.blueBubblesPassword ||
+    options.preset.imessageAdminSenderId,
+  );
+
+  return template
+    .replace(/__WORKSPACE_CWD__/g, escapeTomlString(options.workspaceCwd))
+    .replace(/__GENERATED_WEBHOOK_TOKEN__/g, options.webhookToken)
+    .replace(/__INIT_ALLOW_BLOCKS__/g, allowBlocks)
+    .replace(/__INIT_ADMIN_BLOCKS__/g, adminBlocks)
+    .replace(/__IMESSAGE_ENABLED__/g, imessageEnabled ? "true" : "false")
+    .replace(
+      /__IMESSAGE_PASSWORD__/g,
+      escapeTomlString(options.preset.blueBubblesPassword ?? "replace-with-bluebubbles-server-password"),
+    )
+    .replace(/__TELEGRAM_ENABLED__/g, telegramEnabled ? "true" : "false")
+    .replace(
+      /__TELEGRAM_BOT_TOKEN__/g,
+      escapeTomlString(options.preset.telegramBotToken ?? "replace-with-telegram-bot-token"),
+    );
+}
+
+function buildInitAllowBlocks(preset: InitPreset): string {
+  const sections: string[] = [];
+
+  if (preset.telegramChatId) {
+    sections.push([
+      '[[allow]]',
+      'kind = "conversation"',
+      'transport_id = "primary-telegram"',
+      `conversation_id = "${escapeTomlString(preset.telegramChatId)}"`,
+      'label = "my Telegram DM"',
+    ].join("\n"));
+  }
+
+  if (preset.imessageConversationId) {
+    sections.push([
+      '[[allow]]',
+      'kind = "conversation"',
+      'transport_id = "primary-imessage"',
+      `conversation_id = "${escapeTomlString(preset.imessageConversationId)}"`,
+      'label = "my iMessage chat"',
+    ].join("\n"));
+  }
+
+  if (sections.length === 0) {
+    return "";
+  }
+
+  return `\n\n${sections.join("\n\n")}\n`;
+}
+
+function buildInitAdminBlocks(preset: InitPreset): string {
+  const sections: string[] = [];
+
+  if (preset.telegramChatId) {
+    sections.push([
+      '[[admins]]',
+      'transport_id = "primary-telegram"',
+      `conversation_id = "${escapeTomlString(preset.telegramChatId)}"`,
+      `allowed_sender_ids = ["${escapeTomlString(preset.telegramChatId)}"]`,
+      'command_format = "strict"',
+    ].join("\n"));
+  }
+
+  if (preset.imessageConversationId && preset.imessageAdminSenderId) {
+    sections.push([
+      '[[admins]]',
+      'transport_id = "primary-imessage"',
+      `conversation_id = "${escapeTomlString(preset.imessageConversationId)}"`,
+      `allowed_sender_ids = ["${escapeTomlString(preset.imessageAdminSenderId)}"]`,
+      'command_format = "strict"',
+    ].join("\n"));
+  }
+
+  if (sections.length === 0) {
+    return "";
+  }
+
+  return `\n\n${sections.join("\n\n")}\n`;
+}
+
+function printInitNextSteps(configPath: string, preset: InitPreset): void {
+  const hasPreset = Boolean(
+    preset.telegramChatId ||
+    preset.telegramBotToken ||
+    preset.imessageConversationId ||
+    preset.blueBubblesPassword,
+  );
+
+  console.log("Next steps:");
+  if (!hasPreset) {
+    console.log(`1. Edit ${configPath} and enable one transport.`);
+    console.log("2. Add one narrow allow rule so only you can message Yanny.");
+    console.log("3. If you keep approval_policy = \"untrusted\", add an admin route.");
+    console.log("4. Run: codexclaw doctor");
+    console.log("5. Run: codexclaw start");
+    return;
+  }
+
+  console.log(`1. Review ${configPath} and replace any remaining placeholder secrets.`);
+  if (preset.imessageConversationId && !preset.imessageAdminSenderId) {
+    console.log("2. Add imessage_admin_sender or switch approval_policy to \"never\" before risky actions.");
+    console.log("3. Run: codexclaw doctor");
+    console.log("4. Run: codexclaw start");
+    return;
+  }
+
+  console.log("2. Run: codexclaw doctor");
+  console.log("3. Run: codexclaw start");
 }
 
 async function requestJson<T>(urlString: string): Promise<T> {

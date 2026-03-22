@@ -23,10 +23,7 @@ port = 4188
 
 [policy]
 default = "deny"
-
-# Fastest narrow setup:
-# codexclaw init --telegram-chat 123456789 --telegram-bot-token "$TELEGRAM_BOT_TOKEN"
-# codexclaw init --imessage-chat 'any;-;+15555550123' --bluebubbles-password "$BLUEBUBBLES_PASSWORD" --imessage-admin-sender '+15555550123'
+__INIT_ALLOW_BLOCKS____INIT_ADMIN_BLOCKS__
 
 # Start narrow. Uncomment exactly one of these while you get set up:
 #
@@ -68,7 +65,7 @@ default = "deny"
 id = "primary-imessage"
 channel = "imessage"
 provider = "bluebubbles"
-enabled = false
+enabled = __IMESSAGE_ENABLED__
 
 [transports.triggers]
 direct = "none"
@@ -76,12 +73,12 @@ group = "addressed"
 
 [transports.config]
 server_url = "http://127.0.0.1:1234"
-password = "replace-with-bluebubbles-server-password"
+password = "__IMESSAGE_PASSWORD__"
 webhook_listen_host = "127.0.0.1"
 webhook_listen_port = 4101
 webhook_path = "/webhooks/bluebubbles"
 webhook_public_url = "http://127.0.0.1:4101/webhooks/bluebubbles"
-webhook_token = "replace-with-random-token"
+webhook_token = "__GENERATED_WEBHOOK_TOKEN__"
 auto_register_webhook = true
 webhook_events = ["new-message", "updated-message"]
 
@@ -89,18 +86,18 @@ webhook_events = ["new-message", "updated-message"]
 id = "primary-telegram"
 channel = "telegram"
 provider = "bot-api"
-enabled = false
+enabled = __TELEGRAM_ENABLED__
 
 [transports.triggers]
 direct = "none"
 group = "addressed"
 
 [transports.config]
-bot_token = "replace-with-telegram-bot-token"
+bot_token = "__TELEGRAM_BOT_TOKEN__"
 mode = "polling"
 poll_timeout_seconds = 30
 allowed_updates = ["message"]
 
 [[workspaces]]
 id = "main"
-cwd = "/absolute/path/to/workspace"
+cwd = "__WORKSPACE_CWD__"
