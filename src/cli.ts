@@ -5,10 +5,12 @@ import https from "https";
 import path from "path";
 import { randomBytes } from "crypto";
 import { spawn } from "child_process";
+import { createInterface } from "readline";
 import type { BlueBubblesIMessageTransportConfig, CodexClawConfig, TelegramTransportConfig } from "./config/schema";
 import { loadConfig } from "./config/loadConfig";
 import { startApp, resolveConfigPath } from "./index";
 import { createLogger } from "./logger";
+import { resolveDefaultConfigPath } from "./paths";
 
 type CommandName = "start" | "init" | "doctor" | "help";
 
@@ -27,9 +29,17 @@ interface DoctorCheck {
 interface InitPreset {
   telegramChatId?: string;
   telegramBotToken?: string;
+  telegramAdminEnabled?: boolean;
   imessageConversationId?: string;
   blueBubblesPassword?: string;
   imessageAdminSenderId?: string;
+}
+
+type InitTransportChoice = "telegram" | "imessage";
+
+interface PromptSession {
+  question(prompt: string): Promise<string>;
+  close(): void;
 }
 
 async function main(): Promise<void> {
@@ -63,7 +73,6 @@ async function runInit(parsed: ParsedArgs): Promise<void> {
   const baseDir = path.dirname(configPath);
   const personalityDir = path.join(baseDir, "personality");
   const soulPath = path.join(personalityDir, "soul.md");
-  const varDir = path.join(baseDir, "var");
 
   if (!force) {
     await assertPathDoesNotExist(configPath, "Config file already exists");
@@ -72,7 +81,6 @@ async function runInit(parsed: ParsedArgs): Promise<void> {
 
   await fs.mkdir(baseDir, { recursive: true });
   await fs.mkdir(personalityDir, { recursive: true });
-  await fs.mkdir(varDir, { recursive: true });
 
   const packageRoot = await resolvePackageRoot();
   const configTemplatePath = path.join(packageRoot, "templates", "codexclaw.toml");
@@ -80,7 +88,7 @@ async function runInit(parsed: ParsedArgs): Promise<void> {
 
   const configTemplate = await fs.readFile(configTemplatePath, "utf8");
   const soulTemplate = await fs.readFile(soulTemplatePath, "utf8");
-  const preset = parseInitPreset(parsed);
+  const preset = await resolveInitPreset(parsed);
 
   const renderedConfig = renderInitConfig(configTemplate, {
     workspaceCwd: process.cwd(),
@@ -242,9 +250,19 @@ function printHelp(): void {
   console.log("  codexclaw init [path]");
   console.log("  codexclaw start [path]");
   console.log("");
+  console.log("Defaults:");
+  console.log("  config: ~/.codexclaw/codexclaw.toml");
+  console.log("  soul:   ~/.codexclaw/personality/soul.md");
+  console.log("  state:  ~/.codexclaw/state/codexclaw.db");
+  console.log("");
   console.log("Options:");
   console.log("  --config <path>   Use an explicit config path");
   console.log("  --force           Overwrite files during init");
+  console.log("");
+  console.log("Environment:");
+  console.log("  CODEXCLAW_HOME         Override ~/.codexclaw");
+  console.log("  CODEXCLAW_CONFIG_PATH  Override the default config path");
+  console.log("  CODEXCLAW_STATE_DIR    Override the state directory");
   console.log("");
   console.log("Init presets:");
   console.log("  --telegram-chat <chat-id>              Enable Telegram and allow only that DM");
@@ -314,7 +332,7 @@ function readBooleanFlag(parsed: ParsedArgs, name: string): boolean {
 
 function resolveInitTarget(input?: string): string {
   if (!input) {
-    return path.resolve(process.cwd(), "codexclaw.toml");
+    return resolveDefaultConfigPath();
   }
 
   const resolved = path.resolve(input);
@@ -539,14 +557,179 @@ function looksLikePlaceholder(value: string): boolean {
   return value.includes("replace-with") || value.includes("YOUR_") || value.includes("ADMIN_CHAT_GUID");
 }
 
+async function resolveInitPreset(parsed: ParsedArgs): Promise<InitPreset> {
+  const parsedPreset = parseInitPreset(parsed);
+  const explicitTransport = inferInitTransport(parsedPreset);
+
+  if (explicitTransport === "mixed") {
+    throw new Error("Init flags mixed Telegram and iMessage values. Choose one transport.");
+  }
+
+  if (explicitTransport === "telegram") {
+    return await promptForTelegramInit(parsedPreset);
+  }
+
+  if (explicitTransport === "imessage") {
+    return await promptForIMessageInit(parsedPreset);
+  }
+
+  return await promptForInitWizard();
+}
+
 function parseInitPreset(parsed: ParsedArgs): InitPreset {
+  const telegramChatId = readStringFlag(parsed, "telegram-chat");
+  const telegramBotToken = readStringFlag(parsed, "telegram-bot-token");
+  const imessageConversationId = readStringFlag(parsed, "imessage-chat");
+  const blueBubblesPassword = readStringFlag(parsed, "bluebubbles-password");
+  const imessageAdminSenderId = readStringFlag(parsed, "imessage-admin-sender");
+
   return {
-    telegramChatId: readStringFlag(parsed, "telegram-chat"),
-    telegramBotToken: readStringFlag(parsed, "telegram-bot-token"),
-    imessageConversationId: readStringFlag(parsed, "imessage-chat"),
-    blueBubblesPassword: readStringFlag(parsed, "bluebubbles-password"),
-    imessageAdminSenderId: readStringFlag(parsed, "imessage-admin-sender"),
+    telegramChatId,
+    telegramBotToken,
+    telegramAdminEnabled: telegramChatId || telegramBotToken ? true : undefined,
+    imessageConversationId,
+    blueBubblesPassword,
+    imessageAdminSenderId,
   };
+}
+
+function inferInitTransport(preset: InitPreset): InitTransportChoice | "mixed" | undefined {
+  const hasTelegram = Boolean(preset.telegramChatId || preset.telegramBotToken);
+  const hasIMessage = Boolean(
+    preset.imessageConversationId ||
+    preset.blueBubblesPassword ||
+    preset.imessageAdminSenderId,
+  );
+
+  if (hasTelegram && hasIMessage) {
+    return "mixed";
+  }
+
+  if (hasTelegram) {
+    return "telegram";
+  }
+
+  if (hasIMessage) {
+    return "imessage";
+  }
+
+  return undefined;
+}
+
+async function promptForInitWizard(): Promise<InitPreset> {
+  const io = createPromptSession();
+
+  try {
+    console.log("CodexClaw init");
+    console.log("");
+    console.log("- This will generate a narrow first-run config so only you can message the bot.");
+    console.log(`- By default it writes to ${resolveDefaultConfigPath()}.`);
+    console.log("- Start with one transport and one allowed chat.");
+    console.log("");
+
+    const transport = await promptChoice(io, "First transport", ["telegram", "imessage"]);
+    if (transport === "telegram") {
+      return await promptForTelegramInit({}, io);
+    }
+
+    return await promptForIMessageInit({}, io);
+  } finally {
+    io.close();
+  }
+}
+
+async function promptForTelegramInit(preset: InitPreset, io?: PromptSession): Promise<InitPreset> {
+  const reader = io ?? createPromptSession();
+  const ownsInterface = !io;
+  const cameFromFlags = Boolean(preset.telegramChatId || preset.telegramBotToken || preset.telegramAdminEnabled !== undefined);
+
+  try {
+    console.log("");
+    console.log("Telegram setup");
+    console.log("- Message your bot once from the Telegram account you want to allow.");
+    console.log("- Need a bot token? Open https://t.me/BotFather and run /newbot.");
+    console.log("- If you already have a bot, paste the token below.");
+
+    const botToken = preset.telegramBotToken ?? await promptRequired(reader, "Telegram bot token");
+    let chatId = preset.telegramChatId;
+
+    if (!chatId) {
+      const autoDetect = await promptYesNo(reader, "Detect your Telegram DM chat id from recent bot messages?", true);
+      if (autoDetect) {
+        console.log("- Send your bot a DM in Telegram now, then press Enter here.");
+        await askQuestion(reader, "");
+        const discovered = await discoverLatestTelegramPrivateChat(botToken);
+        if (discovered) {
+          console.log(`- Found Telegram DM: ${discovered.label} (${discovered.chatId})`);
+          chatId = discovered.chatId;
+        } else {
+          console.log("- No recent Telegram DM was found. Paste the chat id manually.");
+        }
+      }
+    }
+
+    chatId = chatId ?? await promptRequired(reader, "Telegram DM chat id");
+    const useSameChatForApprovals = preset.telegramAdminEnabled ?? (cameFromFlags
+      ? true
+      : await promptYesNo(reader, "Use the same Telegram DM for approvals?", true));
+
+    return {
+      telegramBotToken: botToken,
+      telegramChatId: chatId,
+      telegramAdminEnabled: useSameChatForApprovals,
+      imessageConversationId: undefined,
+      blueBubblesPassword: undefined,
+      imessageAdminSenderId: undefined,
+    };
+  } finally {
+    if (ownsInterface) {
+      reader.close();
+    }
+  }
+}
+
+async function promptForIMessageInit(preset: InitPreset, io?: PromptSession): Promise<InitPreset> {
+  const reader = io ?? createPromptSession();
+  const ownsInterface = !io;
+  const cameFromFlags = Boolean(
+    preset.imessageConversationId ||
+    preset.blueBubblesPassword ||
+    preset.imessageAdminSenderId,
+  );
+
+  try {
+    console.log("");
+    console.log("iMessage / BlueBubbles setup");
+    console.log("- Use one explicit chat first.");
+    console.log("- Paste the conversation id from BlueBubbles or an earlier CodexClaw log.");
+
+    const password = preset.blueBubblesPassword ?? await promptRequired(reader, "BlueBubbles server password");
+    const conversationId = preset.imessageConversationId ?? await promptRequired(reader, "iMessage conversation id");
+    let adminSenderId = preset.imessageAdminSenderId;
+
+    if (!adminSenderId && !cameFromFlags) {
+      const useSameChatForApprovals = await promptYesNo(reader, "Use this same iMessage chat for approvals?", true);
+      if (useSameChatForApprovals) {
+        adminSenderId = await promptRequired(
+          reader,
+          "Sender id allowed to approve in that chat (phone number, email, or handle)",
+        );
+      }
+    }
+
+    return {
+      telegramBotToken: undefined,
+      telegramChatId: undefined,
+      telegramAdminEnabled: undefined,
+      blueBubblesPassword: password,
+      imessageConversationId: conversationId,
+      imessageAdminSenderId: adminSenderId,
+    };
+  } finally {
+    if (ownsInterface) {
+      reader.close();
+    }
+  }
 }
 
 function renderInitConfig(
@@ -565,12 +748,14 @@ function renderInitConfig(
     options.preset.blueBubblesPassword ||
     options.preset.imessageAdminSenderId,
   );
+  const approvalPolicy = chooseInitApprovalPolicy(options.preset);
 
   return template
     .replace(/__WORKSPACE_CWD__/g, escapeTomlString(options.workspaceCwd))
     .replace(/__GENERATED_WEBHOOK_TOKEN__/g, options.webhookToken)
     .replace(/__INIT_ALLOW_BLOCKS__/g, allowBlocks)
     .replace(/__INIT_ADMIN_BLOCKS__/g, adminBlocks)
+    .replace(/__APPROVAL_POLICY__/g, approvalPolicy)
     .replace(/__IMESSAGE_ENABLED__/g, imessageEnabled ? "true" : "false")
     .replace(
       /__IMESSAGE_PASSWORD__/g,
@@ -616,7 +801,7 @@ function buildInitAllowBlocks(preset: InitPreset): string {
 function buildInitAdminBlocks(preset: InitPreset): string {
   const sections: string[] = [];
 
-  if (preset.telegramChatId) {
+  if (preset.telegramChatId && inferInitTransport(preset) === "telegram" && preset.telegramAdminEnabled !== false) {
     sections.push([
       '[[admins]]',
       'transport_id = "primary-telegram"',
@@ -653,21 +838,195 @@ function printInitNextSteps(configPath: string, preset: InitPreset): void {
 
   console.log("Next steps:");
   if (!hasPreset) {
-    console.log(`1. Edit ${configPath} and enable one transport.`);
-    console.log("2. Add one narrow allow rule so only you can message Yanny.");
-    console.log("3. If you keep approval_policy = \"untrusted\", add an admin route.");
-    console.log("4. Run: codexclaw start");
+    console.log(`- Edit ${configPath} and enable one transport.`);
+    console.log("- Add one narrow allow rule so only you can message Yanny.");
+    console.log("- If you keep approval_policy = \"untrusted\", add an admin route.");
+    console.log(`- Run: ${renderStartCommand(configPath)}`);
     return;
   }
 
-  console.log(`1. Review ${configPath} and replace any remaining placeholder secrets.`);
+  console.log(`- Review ${configPath} and replace any remaining placeholder secrets.`);
   if (preset.imessageConversationId && !preset.imessageAdminSenderId) {
-    console.log("2. Add imessage_admin_sender or switch approval_policy to \"never\" before risky actions.");
-    console.log("3. Run: codexclaw start");
+    console.log("- Approval policy was set to \"never\" because no admin sender was configured.");
+    console.log(`- Run: ${renderStartCommand(configPath)}`);
     return;
   }
 
-  console.log("2. Run: codexclaw start");
+  if (chooseInitApprovalPolicy(preset) === "never") {
+    console.log("- Approval policy was set to \"never\" for first-run simplicity.");
+    console.log(`- Run: ${renderStartCommand(configPath)}`);
+    return;
+  }
+
+  console.log(`- Run: ${renderStartCommand(configPath)}`);
+}
+
+function renderStartCommand(configPath: string): string {
+  return path.resolve(configPath) === resolveDefaultConfigPath()
+    ? "codexclaw start"
+    : `codexclaw start --config ${configPath}`;
+}
+
+function chooseInitApprovalPolicy(preset: InitPreset): string {
+  if (!inferInitTransport(preset)) {
+    return "untrusted";
+  }
+
+  return hasInitAdminRoute(preset) ? "untrusted" : "never";
+}
+
+function hasInitAdminRoute(preset: InitPreset): boolean {
+  if (preset.telegramChatId && inferInitTransport(preset) === "telegram" && preset.telegramAdminEnabled !== false) {
+    return true;
+  }
+
+  return Boolean(preset.imessageConversationId && preset.imessageAdminSenderId);
+}
+
+async function promptRequired(
+  io: PromptSession,
+  label: string,
+): Promise<string> {
+  while (true) {
+    const answer = (await askQuestion(io, `${label}: `)).trim();
+    if (answer.length > 0) {
+      return answer;
+    }
+  }
+}
+
+async function promptChoice(
+  io: PromptSession,
+  label: string,
+  choices: InitTransportChoice[],
+): Promise<InitTransportChoice> {
+  const renderedChoices = choices.join("/");
+
+  while (true) {
+    const answer = (await askQuestion(io, `${label} (${renderedChoices}): `)).trim().toLowerCase();
+    if (answer === "telegram" || answer === "t") {
+      return "telegram";
+    }
+    if (answer === "imessage" || answer === "i") {
+      return "imessage";
+    }
+  }
+}
+
+async function promptYesNo(
+  io: PromptSession,
+  label: string,
+  defaultYes: boolean,
+): Promise<boolean> {
+  const suffix = defaultYes ? "[Y/n]" : "[y/N]";
+
+  while (true) {
+    const answer = (await askQuestion(io, `${label} ${suffix} `)).trim().toLowerCase();
+    if (!answer) {
+      return defaultYes;
+    }
+    if (answer === "y" || answer === "yes") {
+      return true;
+    }
+    if (answer === "n" || answer === "no") {
+      return false;
+    }
+  }
+}
+
+async function discoverLatestTelegramPrivateChat(
+  botToken: string,
+): Promise<{ chatId: string; label: string } | undefined> {
+  const result = await requestJson<{
+    ok: boolean;
+    result?: Array<{
+      message?: {
+        chat?: { id?: number; type?: string; first_name?: string; last_name?: string; username?: string };
+        from?: { first_name?: string; last_name?: string; username?: string };
+      };
+    }>;
+    description?: string;
+  }>(`https://api.telegram.org/bot${botToken}/getUpdates`);
+
+  if (!result.ok || !result.result) {
+    return undefined;
+  }
+
+  for (const update of [...result.result].reverse()) {
+    const chat = update.message?.chat;
+    if (chat?.type !== "private" || chat.id === undefined) {
+      continue;
+    }
+
+    const label = [chat.first_name, chat.last_name].filter(Boolean).join(" ").trim()
+      || chat.username
+      || String(chat.id);
+
+    return {
+      chatId: String(chat.id),
+      label,
+    };
+  }
+
+  return undefined;
+}
+
+async function askQuestion(io: PromptSession, prompt: string): Promise<string> {
+  return await io.question(prompt);
+}
+
+function createPromptSession(): PromptSession {
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    const io = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    return {
+      question(prompt: string): Promise<string> {
+        return new Promise<string>((resolve) => {
+          io.question(prompt, resolve);
+        });
+      },
+      close(): void {
+        io.close();
+      },
+    };
+  }
+
+  let bufferedLines: string[] | undefined;
+
+  return {
+    async question(prompt: string): Promise<string> {
+      if (process.stdout.writable) {
+        process.stdout.write(prompt);
+      }
+
+      if (!bufferedLines) {
+        bufferedLines = await readAllStdinLines();
+      }
+
+      return bufferedLines.shift() ?? "";
+    },
+    close(): void {
+      return;
+    },
+  };
+}
+
+async function readAllStdinLines(): Promise<string[]> {
+  const chunks: Buffer[] = [];
+
+  return await new Promise<string[]>((resolve, reject) => {
+    process.stdin.on("data", (chunk) => {
+      chunks.push(Buffer.from(chunk));
+    });
+    process.stdin.on("end", () => {
+      const text = Buffer.concat(chunks).toString("utf8");
+      resolve(text.split(/\r?\n/));
+    });
+    process.stdin.on("error", reject);
+  });
 }
 
 async function requestJson<T>(urlString: string): Promise<T> {

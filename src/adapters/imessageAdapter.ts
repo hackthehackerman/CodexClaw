@@ -1,6 +1,14 @@
 import type { IMessageTransportConfig } from "../config/schema";
 import type { Logger } from "../logger";
-import type { Attachment, ChannelAdapter, MessageHandler, OutboundMessage } from "./base";
+import type {
+  AdapterEventHandlers,
+  AdapterFeatures,
+  ApprovalPrompt,
+  ApprovalPromptUpdate,
+  Attachment,
+  ChannelAdapter,
+  OutboundMessage,
+} from "./base";
 import { BlueBubblesIMessageAdapter } from "./imessage/blueBubblesAdapter";
 
 export class IMessageAdapter implements ChannelAdapter {
@@ -28,8 +36,8 @@ export class IMessageAdapter implements ChannelAdapter {
     return "imessage";
   }
 
-  async start(handler: MessageHandler): Promise<void> {
-    await this.delegate.start(handler);
+  async start(handlers: AdapterEventHandlers): Promise<void> {
+    await this.delegate.start(handlers);
   }
 
   async stop(): Promise<void> {
@@ -42,5 +50,25 @@ export class IMessageAdapter implements ChannelAdapter {
 
   async materializeAttachment(attachment: Attachment): Promise<Attachment> {
     return await this.delegate.materializeAttachment(attachment);
+  }
+
+  getFeatures(): AdapterFeatures {
+    return this.delegate.getFeatures();
+  }
+
+  async sendApprovalPrompt(prompt: ApprovalPrompt): Promise<void> {
+    if (!this.delegate.sendApprovalPrompt) {
+      throw new Error("Delegate does not support approval prompts");
+    }
+
+    await this.delegate.sendApprovalPrompt(prompt);
+  }
+
+  async finalizeApprovalPrompt(update: ApprovalPromptUpdate): Promise<void> {
+    if (!this.delegate.finalizeApprovalPrompt) {
+      return;
+    }
+
+    await this.delegate.finalizeApprovalPrompt(update);
   }
 }

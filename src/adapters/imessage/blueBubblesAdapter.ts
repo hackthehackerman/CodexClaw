@@ -7,7 +7,15 @@ import { promises as fs } from "fs";
 import { z } from "zod";
 import type { BlueBubblesIMessageTransportConfig } from "../../config/schema";
 import type { Logger } from "../../logger";
-import type { Attachment, ChannelAdapter, InboundMessage, MessageHandler, OutboundMessage } from "../base";
+import type {
+  AdapterEventHandlers,
+  AdapterFeatures,
+  ApprovalPrompt,
+  Attachment,
+  ChannelAdapter,
+  InboundMessage,
+  OutboundMessage,
+} from "../base";
 
 const blueBubblesWebhookEnvelopeSchema = z.object({
   type: z.string().min(1),
@@ -68,7 +76,7 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
   readonly channel = "imessage" as const;
   readonly id: string;
 
-  private handler?: MessageHandler;
+  private handlers?: AdapterEventHandlers;
   private server?: http.Server;
   private nextTempGuid = 1;
   private readonly recentOutgoingMessages: RecentOutgoingMessage[] = [];
@@ -89,8 +97,8 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
     ));
   }
 
-  async start(handler: MessageHandler): Promise<void> {
-    this.handler = handler;
+  async start(handlers: AdapterEventHandlers): Promise<void> {
+    this.handlers = handlers;
     await this.loadKnownContacts();
     await this.startWebhookServer();
 
@@ -111,7 +119,7 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
   }
 
   async stop(): Promise<void> {
-    this.handler = undefined;
+    this.handlers = undefined;
 
     if (this.server) {
       await new Promise<void>((resolve, reject) => {
@@ -217,6 +225,27 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
     };
   }
 
+  getFeatures(): AdapterFeatures {
+    return {
+      approvalTextCommands: true,
+      approvalInteractive: false,
+    };
+  }
+
+  async sendApprovalPrompt(prompt: ApprovalPrompt): Promise<void> {
+    const lines = [
+      `CodexClaw approval ${prompt.approvalId}`,
+      `Kind: ${prompt.kind}`,
+      `Summary: ${prompt.summary}`,
+      `Reply with: APPROVE ${prompt.approvalId}, APPROVE ${prompt.approvalId} SESSION, DENY ${prompt.approvalId}, or CANCEL ${prompt.approvalId}`,
+    ];
+
+    await this.sendMessage({
+      conversationId: prompt.conversationId,
+      text: lines.join("\n"),
+    });
+  }
+
   private async startWebhookServer(): Promise<void> {
     const { webhookListenHost, webhookListenPort } = this.config.config;
 
@@ -281,7 +310,7 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
       return;
     }
 
-    if (!this.handler) {
+    if (!this.handlers?.onMessage) {
       this.logger.warn("Received BlueBubbles webhook before adapter handler was ready", {
         adapterId: this.id,
         eventType: envelope.type,
@@ -309,7 +338,7 @@ export class BlueBubblesIMessageAdapter implements ChannelAdapter {
       textPreview: previewText(message.text),
     });
 
-    await this.handler(message);
+    await this.handlers.onMessage(message);
   }
 
   private normalizeInboundMessage(envelope: BlueBubblesWebhookEnvelope): InboundMessage | null {

@@ -24,6 +24,7 @@ export const reasoningEffortSchema = z.enum([
 
 export const telegramAllowedUpdateSchema = z.enum([
   "message",
+  "callback_query",
 ]);
 
 export const triggerModeSchema = z.enum([
@@ -54,7 +55,7 @@ const codexSchema = z.object({
 });
 
 const storageSchema = z.object({
-  dbPath: z.string().min(1).default("./var/codexclaw.db"),
+  dbPath: z.string().min(1).default("./state/codexclaw.db"),
 });
 
 const webSchema = z.object({
@@ -106,7 +107,7 @@ const telegramBotApiConfigSchema = z.object({
   botToken: z.string().min(1),
   mode: z.literal("polling").default("polling"),
   pollTimeoutSeconds: z.number().int().positive().max(60).default(30),
-  allowedUpdates: z.array(telegramAllowedUpdateSchema).min(1).default(["message"]),
+  allowedUpdates: z.array(telegramAllowedUpdateSchema).min(1).default(["message", "callback_query"]),
 });
 
 const telegramTransportSchema = transportBaseSchema.extend({

@@ -45,19 +45,10 @@ export class SessionRouter {
   }
 
   match(message: InboundMessage): RouteContext | undefined {
-    if (this.isAdminConversation(message)) {
-      const admin = this.options.admins.find((candidate) =>
-        candidate.transportId === message.adapterId && candidate.conversationId === message.conversationId,
-      );
+    return this.matchAdmin(message) ?? this.matchUser(message);
+  }
 
-      return {
-        kind: "admin",
-        workspace: this.workspace,
-        label: "admin",
-        allowedSenderIds: admin?.allowedSenderIds,
-      };
-    }
-
+  matchUser(message: InboundMessage): RouteContext | undefined {
     if (this.options.denyRules.some((rule) => matchesAccessRule(rule, message))) {
       return undefined;
     }
@@ -79,6 +70,23 @@ export class SessionRouter {
     }
 
     return undefined;
+  }
+
+  matchAdmin(message: InboundMessage): RouteContext | undefined {
+    if (!this.isAdminConversation(message)) {
+      return undefined;
+    }
+
+    const admin = this.options.admins.find((candidate) =>
+      candidate.transportId === message.adapterId && candidate.conversationId === message.conversationId,
+    );
+
+    return {
+      kind: "admin",
+      workspace: this.workspace,
+      label: "admin",
+      allowedSenderIds: admin?.allowedSenderIds,
+    };
   }
 
   async getOrCreateChatSession(message: InboundMessage): Promise<ChatSession> {

@@ -1,9 +1,9 @@
 import type { Logger } from "../logger";
-import type { Attachment, ChannelAdapter, MessageHandler, OutboundMessage } from "./base";
+import type { AdapterEventHandlers, AdapterFeatures, Attachment, ChannelAdapter, OutboundMessage } from "./base";
 
 export class WhatsAppAdapter implements ChannelAdapter {
   readonly channel = "whatsapp" as const;
-  private handler?: MessageHandler;
+  private handlers?: AdapterEventHandlers;
 
   constructor(
     readonly id: string,
@@ -11,14 +11,21 @@ export class WhatsAppAdapter implements ChannelAdapter {
     private readonly provider: string,
   ) {}
 
-  async start(handler: MessageHandler): Promise<void> {
-    this.handler = handler;
+  async start(handlers: AdapterEventHandlers): Promise<void> {
+    this.handlers = handlers;
     this.logger.info("Started WhatsApp adapter", { adapterId: this.id, provider: this.provider });
   }
 
   async stop(): Promise<void> {
-    this.handler = undefined;
+    this.handlers = undefined;
     this.logger.info("Stopped WhatsApp adapter", { adapterId: this.id });
+  }
+
+  getFeatures(): AdapterFeatures {
+    return {
+      approvalTextCommands: false,
+      approvalInteractive: false,
+    };
   }
 
   async sendMessage(message: OutboundMessage): Promise<void> {

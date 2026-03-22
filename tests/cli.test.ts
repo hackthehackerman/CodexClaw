@@ -50,6 +50,34 @@ test("init can generate a narrow Telegram-only config", async () => {
   }
 });
 
+test("interactive init can guide a Telegram-only setup", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codexclaw-cli-"));
+  const configPath = path.join(tempDir, "codexclaw.toml");
+
+  try {
+    const result = await runCli([
+      "init",
+      "--config",
+      configPath,
+      "--force",
+    ], tempDir, "telegram\n123456:verification-token\nn\n123456789\ny\n");
+
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+
+    const config = await loadConfig(configPath, new TestLogger());
+    assert.equal(config.transports.find((transport) => transport.id === "primary-telegram")?.enabled, true);
+    assert.equal(config.allow[0]?.kind, "conversation");
+    if (config.allow[0]?.kind !== "conversation") {
+      throw new Error("Expected conversation allow rule");
+    }
+    assert.equal(config.allow[0].conversationId, "123456789");
+    assert.equal(config.codex.approvalPolicy, "untrusted");
+    assert.equal(config.admins.length, 1);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("doctor offline passes for generated iMessage-only config", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "codexclaw-cli-"));
   const configPath = path.join(tempDir, "codexclaw.toml");
@@ -88,15 +116,49 @@ test("doctor offline passes for generated iMessage-only config", async () => {
   }
 });
 
-async function runCli(args: string[], cwd: string): Promise<CliResult> {
+test("init defaults to CODEXCLAW_HOME when no config path is provided", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codexclaw-cli-"));
+  const homeDir = path.join(tempDir, "home");
+  const configPath = path.join(homeDir, "codexclaw.toml");
+
+  try {
+    const result = await runCli([
+      "init",
+      "--force",
+      "--telegram-chat",
+      "123456789",
+      "--telegram-bot-token",
+      "123456:verification-token",
+    ], tempDir, undefined, {
+      CODEXCLAW_HOME: homeDir,
+    });
+
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    const config = await loadConfig(configPath, new TestLogger());
+    assert.equal(config.transports.find((transport) => transport.id === "primary-telegram")?.enabled, true);
+    assert.match(result.stdout, new RegExp(`Created ${escapeRegExp(configPath)}`));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+async function runCli(
+  args: string[],
+  cwd: string,
+  stdinInput?: string,
+  envOverrides?: NodeJS.ProcessEnv,
+): Promise<CliResult> {
   await mkdir(cwd, { recursive: true });
   const cliPath = path.resolve(__dirname, "../src/cli.js");
 
   return await new Promise<CliResult>((resolve, reject) => {
     const child = spawn(process.execPath, [cliPath, ...args], {
       cwd,
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        ...envOverrides,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
     let stdout = "";
@@ -110,6 +172,16 @@ async function runCli(args: string[], cwd: string): Promise<CliResult> {
       stderr += chunk.toString("utf8");
     });
 
+    if (stdinInput !== undefined) {
+      const stdin = child.stdin as NodeJS.WritableStream | null;
+      if (!stdin) {
+        reject(new Error("Expected child stdin to be available"));
+        return;
+      }
+      stdin.write(stdinInput);
+      stdin.end();
+    }
+
     child.once("error", reject);
     child.once("exit", (code) => {
       resolve({
@@ -119,4 +191,8 @@ async function runCli(args: string[], cwd: string): Promise<CliResult> {
       });
     });
   });
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

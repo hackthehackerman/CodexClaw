@@ -10,17 +10,25 @@ npm install -g codexclaw
 
 Make sure `codex` is installed and already authenticated on the same machine.
 
-## 2. Initialize a local config
-
-From the workspace where you want CodexClaw to run:
+## 2. Initialize the default config
 
 ```bash
 codexclaw init
 ```
 
 This creates:
-- `codexclaw.toml`
-- `personality/soul.md`
+- `~/.codexclaw/codexclaw.toml`
+- `~/.codexclaw/personality/soul.md`
+- `~/.codexclaw/state/codexclaw.db`
+
+`codexclaw init` is interactive by default. It will walk you through a narrow first-run setup for one transport.
+
+If you want a project-local install instead, run:
+
+```bash
+codexclaw init --config /path/to/codexclaw.toml
+codexclaw start --config /path/to/codexclaw.toml
+```
 
 ## 3. Pick one transport first
 
@@ -45,9 +53,9 @@ That generates:
 
 Manual path:
 
-1. Create a bot with `@BotFather`
+1. Create a bot with [`@BotFather`](https://t.me/BotFather) and run `/newbot`
 2. Copy the bot token
-3. In `codexclaw.toml`, set:
+3. In `~/.codexclaw/codexclaw.toml`, set:
    - `[[transports]]` for Telegram to `enabled = true`
    - `bot_token` to the real token
 4. Add a narrow allow rule for your own Telegram chat:
@@ -87,7 +95,7 @@ Manual path:
 
 1. Install and configure BlueBubbles Server on the Mac that runs Messages
 2. Confirm BlueBubbles local API works
-3. In `codexclaw.toml`, set:
+3. In `~/.codexclaw/codexclaw.toml`, set:
    - `[[transports]]` for iMessage to `enabled = true`
    - `password` to the BlueBubbles server password
 4. Add one explicit iMessage conversation allow rule:

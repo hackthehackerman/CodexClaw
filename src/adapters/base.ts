@@ -1,4 +1,6 @@
 export type ChannelName = "imessage" | "telegram" | "whatsapp";
+export type ApprovalKind = "command" | "fileChange" | "permissions";
+export type ApprovalAction = "approve_once" | "approve_session" | "deny" | "cancel";
 
 export interface Attachment {
   id?: string;
@@ -35,13 +37,54 @@ export interface OutboundMessage {
   attachments?: Attachment[];
 }
 
-export type MessageHandler = (message: InboundMessage) => Promise<void>;
+export interface ApprovalActionEvent {
+  adapterId: string;
+  channel: ChannelName;
+  conversationId: string;
+  senderId: string;
+  senderName: string;
+  approvalId: string;
+  action: ApprovalAction;
+  messageId?: string;
+  raw: unknown;
+}
+
+export interface AdapterEventHandlers {
+  onMessage: (message: InboundMessage) => Promise<void>;
+  onApprovalAction?: (action: ApprovalActionEvent) => Promise<void>;
+}
+
+export interface ApprovalPrompt {
+  conversationId: string;
+  approvalId: string;
+  kind: ApprovalKind;
+  summary: string;
+  actions: ApprovalAction[];
+}
+
+export interface ApprovalPromptUpdate {
+  approvalId: string;
+  status: "approved" | "denied" | "canceled";
+  action?: ApprovalAction;
+  actorId?: string;
+  actorName?: string;
+  conversationId?: string;
+  messageId?: string;
+}
+
+export interface AdapterFeatures {
+  approvalTextCommands: boolean;
+  approvalInteractive: boolean;
+}
 
 export interface ChannelAdapter {
   readonly id: string;
   readonly channel: ChannelName;
-  start(handler: MessageHandler): Promise<void>;
+  start(handlers: AdapterEventHandlers): Promise<void>;
   stop(): Promise<void>;
+  getFeatures(): AdapterFeatures;
   sendMessage(message: OutboundMessage): Promise<void>;
   materializeAttachment(attachment: Attachment): Promise<Attachment>;
+  sendApprovalPrompt?(prompt: ApprovalPrompt): Promise<void>;
+  finalizeApprovalPrompt?(update: ApprovalPromptUpdate): Promise<void>;
 }

@@ -92,6 +92,8 @@ async function createTelegramApiServer(options?: {
 
     if (
       url.pathname === `/bot${token}/sendMessage`
+      || url.pathname === `/bot${token}/editMessageText`
+      || url.pathname === `/bot${token}/answerCallbackQuery`
       || url.pathname === `/bot${token}/sendPhoto`
       || url.pathname === `/bot${token}/sendDocument`
     ) {
@@ -180,11 +182,13 @@ test("TelegramAdapter normalizes private slash commands and group mentions into 
 
   try {
     const done = new Promise<void>((resolve) => {
-      void adapter.start(async (message) => {
-        messages.push(message);
-        if (messages.length === 2) {
-          resolve();
-        }
+      void adapter.start({
+        onMessage: async (message) => {
+          messages.push(message);
+          if (messages.length === 2) {
+            resolve();
+          }
+        },
       });
     });
 
@@ -237,12 +241,14 @@ test("TelegramAdapter retries the same update until the handler succeeds", async
 
   try {
     const done = new Promise<void>((resolve) => {
-      void adapter.start(async () => {
-        attempts += 1;
-        if (attempts === 1) {
-          throw new Error("try again");
-        }
-        resolve();
+      void adapter.start({
+        onMessage: async () => {
+          attempts += 1;
+          if (attempts === 1) {
+            throw new Error("try again");
+          }
+          resolve();
+        },
       });
     });
 
@@ -316,11 +322,13 @@ test("TelegramAdapter classifies voice and audio documents as audio attachments"
 
   try {
     const done = new Promise<void>((resolve) => {
-      void adapter.start(async (message) => {
-        messages.push(message);
-        if (messages.length === 2) {
-          resolve();
-        }
+      void adapter.start({
+        onMessage: async (message) => {
+          messages.push(message);
+          if (messages.length === 2) {
+            resolve();
+          }
+        },
       });
     });
 
@@ -349,7 +357,9 @@ test("TelegramAdapter sends text, photos, and documents through Bot API methods"
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "codexclaw-telegram-send-"));
 
   try {
-    await adapter.start(async () => undefined);
+    await adapter.start({
+      onMessage: async () => undefined,
+    });
 
     const imagePath = path.join(tempDir, "image.png");
     const filePath = path.join(tempDir, "file.txt");
@@ -373,6 +383,96 @@ test("TelegramAdapter sends text, photos, and documents through Bot API methods"
   } finally {
     process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = previousBaseUrl;
     await rm(tempDir, { recursive: true, force: true });
+    await api.close();
+  }
+});
+
+test("TelegramAdapter sends approval prompts with inline buttons and handles callback queries", async () => {
+  const api = await createTelegramApiServer({
+    getUpdates(call) {
+      if (call > 1) {
+        return [];
+      }
+
+      return [
+        {
+          update_id: 401,
+          callback_query: {
+            id: "cbq-1",
+            from: { id: 111, is_bot: false, first_name: "Demo" },
+            data: "ca:APPR_1:o",
+            message: {
+              message_id: 99,
+              date: 1_700_000_300,
+              chat: { id: 42, type: "private", first_name: "Demo" },
+              from: { id: 9001, is_bot: true, first_name: "YannyBot" },
+              text: "approval prompt",
+            },
+          },
+        },
+      ];
+    },
+  });
+  const previousBaseUrl = process.env.CODEXCLAW_TELEGRAM_API_BASE_URL;
+  process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = api.baseUrl;
+
+  const adapter = createAdapter(api.token);
+  const approvalActions: Array<{ approvalId: string; action: string }> = [];
+
+  try {
+    const done = new Promise<void>((resolve) => {
+      void adapter.start({
+        onMessage: async () => undefined,
+        onApprovalAction: async (action) => {
+          approvalActions.push({
+            approvalId: action.approvalId,
+            action: action.action,
+          });
+          resolve();
+        },
+      });
+    });
+
+    await adapter.sendApprovalPrompt({
+      conversationId: "42",
+      approvalId: "APPR_1",
+      kind: "command",
+      summary: "Run tests",
+      actions: ["approve_once", "approve_session", "deny"],
+    });
+
+    await done;
+    await adapter.finalizeApprovalPrompt({
+      approvalId: "APPR_1",
+      status: "approved",
+      action: "approve_once",
+      actorName: "Demo",
+      conversationId: "42",
+      messageId: "99",
+    });
+    await adapter.stop();
+
+    assert.deepEqual(approvalActions, [{ approvalId: "APPR_1", action: "approve_once" }]);
+
+    const sendMessageRequest = api.requests.find((request) => request.pathname.endsWith("/sendMessage"));
+    assert.ok(sendMessageRequest);
+    assert.deepEqual((sendMessageRequest?.json as Record<string, unknown>).reply_markup, {
+      inline_keyboard: [[
+        { text: "Approve once", callback_data: "ca:APPR_1:o" },
+        { text: "Approve session", callback_data: "ca:APPR_1:s" },
+        { text: "Deny", callback_data: "ca:APPR_1:d" },
+      ]],
+    });
+    const buttons = (((sendMessageRequest?.json as Record<string, unknown>).reply_markup as {
+      inline_keyboard: Array<Array<{ callback_data: string }>>;
+    }).inline_keyboard[0] ?? []);
+    for (const button of buttons) {
+      assert.ok(button.callback_data.length <= 64);
+    }
+    assert.ok(api.requests.some((request) => request.pathname.endsWith("/answerCallbackQuery")));
+    assert.ok(api.requests.some((request) => request.pathname.endsWith("/editMessageText")));
+  } finally {
+    process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = previousBaseUrl;
     await api.close();
   }
 });

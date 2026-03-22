@@ -3,7 +3,7 @@ export type AdminCommand =
   | { action: "deny"; approvalId: string }
   | { action: "cancel"; approvalId: string };
 
-const commandPattern = /^(APPROVE|DENY|CANCEL)\s+([A-Z0-9_-]+)(?:\s+(SESSION))?$/i;
+const commandPattern = /^(APPROVE|DENY|CANCEL)\s+([A-Za-z0-9_-]+)(?:\s+(SESSION))?$/i;
 
 export function parseAdminCommand(text: string): AdminCommand | null {
   const match = text.trim().match(commandPattern);
@@ -13,7 +13,7 @@ export function parseAdminCommand(text: string): AdminCommand | null {
   }
 
   const action = match[1].toUpperCase();
-  const approvalId = match[2].toUpperCase();
+  const approvalId = match[2];
   const sessionFlag = match[3]?.toUpperCase() === "SESSION";
 
   if (action === "APPROVE") {
@@ -30,4 +30,3 @@ export function parseAdminCommand(text: string): AdminCommand | null {
 
   return { action: "cancel", approvalId };
 }
-

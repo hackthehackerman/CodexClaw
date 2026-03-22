@@ -81,7 +81,7 @@ cwd = "."
     }
     assert.equal(config.transports[1].config.botToken, "token");
     assert.equal(config.transports[1].config.mode, "polling");
-    assert.deepEqual(config.transports[1].config.allowedUpdates, ["message"]);
+    assert.deepEqual(config.transports[1].config.allowedUpdates, ["message", "callback_query"]);
     assert.equal(config.transports[1].triggers.direct, "none");
     assert.equal(config.transports[1].triggers.group, "addressed");
   } finally {

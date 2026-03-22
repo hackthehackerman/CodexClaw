@@ -7,14 +7,14 @@ allow_self_messages = false
 
 [codex]
 command = ["codex", "app-server"]
-approval_policy = "untrusted"
+approval_policy = "__APPROVAL_POLICY__"
 sandbox = "workspace-write"
 model = "gpt-5.4"
 effort = "medium"
 summary = "concise"
 
 [storage]
-db_path = "./var/codexclaw.db"
+db_path = "./state/codexclaw.db"
 
 [web]
 enabled = true
@@ -96,7 +96,7 @@ group = "addressed"
 bot_token = "__TELEGRAM_BOT_TOKEN__"
 mode = "polling"
 poll_timeout_seconds = 30
-allowed_updates = ["message"]
+allowed_updates = ["message", "callback_query"]
 
 [[workspaces]]
 id = "main"

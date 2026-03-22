@@ -3,6 +3,7 @@ import path from "path";
 import TOML from "@iarna/toml";
 import { z } from "zod";
 import type { Logger } from "../logger";
+import { resolveDefaultStateDbPath, resolveDefaultStateDir } from "../paths";
 import { configSchema, type CodexClawConfig } from "./schema";
 
 export const rawConfigSchema = z.object({
@@ -52,9 +53,12 @@ export async function loadConfig(configPath: string, logger: Logger): Promise<Co
   try {
     rawText = await fs.readFile(resolvedPath, "utf8");
   } catch (error) {
-    logger.error("Failed to read config file", { configPath: resolvedPath, error });
+    const ioError = error as NodeJS.ErrnoException;
+    if (ioError.code && ioError.code !== "ENOENT") {
+      logger.error("Failed to read config file", { configPath: resolvedPath, error });
+    }
     throw new Error(
-      `Config file not found at ${resolvedPath}. Copy codexclaw.example.toml to codexclaw.toml and edit it.`,
+      `Config file not found at ${resolvedPath}. Run codexclaw init to create the default config, or pass --config /path/to/codexclaw.toml.`,
     );
   }
 
@@ -69,6 +73,9 @@ export function parseConfigText(rawText: string, configPath: string, logger: Log
   const baseDir = path.dirname(resolvedPath);
   const tomlValue = TOML.parse(rawText);
   const parsed = rawConfigSchema.parse(tomlValue);
+  const configuredStateDir = process.env.CODEXCLAW_STATE_DIR
+    ? resolveDefaultStateDir()
+    : undefined;
 
   const normalized = configSchema.parse({
     bot: {
@@ -87,7 +94,9 @@ export function parseConfigText(rawText: string, configPath: string, logger: Log
       summary: parsed.codex?.summary,
     },
     storage: {
-      dbPath: resolvePath(baseDir, parsed.storage?.db_path ?? "./var/codexclaw.db"),
+      dbPath: configuredStateDir
+        ? resolveDefaultStateDbPath()
+        : resolvePath(baseDir, parsed.storage?.db_path ?? "./state/codexclaw.db"),
     },
     web: {
       enabled: parsed.web?.enabled,
@@ -163,7 +172,7 @@ function normalizeTransport(transport: Record<string, unknown>): Record<string, 
         botToken: config.bot_token,
         mode: config.mode,
         pollTimeoutSeconds: config.poll_timeout_seconds,
-        allowedUpdates: config.allowed_updates,
+        allowedUpdates: ensureTelegramAllowedUpdates(config.allowed_updates),
       },
     };
   }
@@ -179,6 +188,17 @@ function normalizeTransport(transport: Record<string, unknown>): Record<string, 
     },
     config,
   };
+}
+
+function ensureTelegramAllowedUpdates(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  return Array.from(new Set([
+    ...value.filter((entry): entry is string => typeof entry === "string"),
+    "callback_query",
+  ]));
 }
 
 function normalizeAccessRule(rule: Record<string, unknown>): Record<string, unknown> {

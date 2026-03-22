@@ -6,5 +6,6 @@ dist-test/
 output/
 tmp/
 var/
+state/
 prompts/
 personality/

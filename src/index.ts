@@ -1,7 +1,7 @@
-import path from "path";
 import { createApp } from "./app";
 import { loadConfig } from "./config/loadConfig";
 import { createLogger } from "./logger";
+import { resolveRuntimeConfigPath } from "./paths";
 
 export async function startApp(explicitConfigPath?: string): Promise<void> {
   const logger = createLogger();
@@ -12,12 +12,11 @@ export async function startApp(explicitConfigPath?: string): Promise<void> {
 }
 
 export function resolveConfigPath(explicit?: string): string {
-  const configured = explicit ?? process.env.CODEXCLAW_CONFIG ?? process.argv[2];
-  return configured ? path.resolve(configured) : path.resolve(process.cwd(), "codexclaw.toml");
+  return resolveRuntimeConfigPath(explicit);
 }
 
 if (require.main === module) {
-  startApp().catch((error) => {
+  startApp(process.argv[2]).catch((error) => {
     console.error(error);
     process.exitCode = 1;
   });

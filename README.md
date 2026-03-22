@@ -40,12 +40,23 @@ npm install -g codexclaw
 
 ## Quickstart
 
-From the workspace where you want CodexClaw to run:
-
 ```bash
 codexclaw init
 codexclaw start
 ```
+
+`codexclaw init` is interactive by default. It can also take preset flags if you already know your transport details.
+By default it creates and uses:
+- `~/.codexclaw/codexclaw.toml`
+- `~/.codexclaw/personality/soul.md`
+- `~/.codexclaw/state/codexclaw.db`
+
+If you want a project-local setup instead, pass `--config /path/to/codexclaw.toml` to both `init` and `start`.
+
+Environment overrides:
+- `CODEXCLAW_HOME`
+- `CODEXCLAW_CONFIG_PATH`
+- `CODEXCLAW_STATE_DIR`
 
 Fastest safe presets:
 
@@ -55,8 +66,8 @@ codexclaw init --imessage-chat 'any;-;+15555550123' --bluebubbles-password "$BLU
 ```
 
 `codexclaw init` creates:
-- `codexclaw.toml`
-- `personality/soul.md`
+- `~/.codexclaw/codexclaw.toml`
+- `~/.codexclaw/personality/soul.md`
 
 The generated config starts closed by default:
 - `policy.default = "deny"`
@@ -67,7 +78,7 @@ That means nobody can message Yanny until you explicitly configure access.
 
 ## First Run
 
-1. Edit `codexclaw.toml`
+1. Edit `~/.codexclaw/codexclaw.toml`
 2. Enable one transport
 3. Add one narrow allow rule so only you can message it
 4. If you keep `approval_policy = "untrusted"`, add an admin route
@@ -85,6 +96,7 @@ codexclaw start
 You can also pass an explicit config path:
 
 ```bash
+codexclaw init --config /path/to/codexclaw.toml
 codexclaw start --config /path/to/codexclaw.toml
 ```
 

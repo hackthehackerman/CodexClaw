@@ -5,7 +5,16 @@ import path from "path";
 import { promises as fs } from "fs";
 import type { TelegramTransportConfig } from "../config/schema";
 import type { Logger } from "../logger";
-import type { Attachment, ChannelAdapter, InboundMessage, MessageHandler, OutboundMessage } from "./base";
+import type {
+  AdapterEventHandlers,
+  AdapterFeatures,
+  ApprovalPrompt,
+  ApprovalPromptUpdate,
+  Attachment,
+  ChannelAdapter,
+  InboundMessage,
+  OutboundMessage,
+} from "./base";
 
 interface TelegramApiResponse<T> {
   ok: boolean;
@@ -76,9 +85,17 @@ interface TelegramMessage {
   document?: TelegramDocument;
 }
 
+interface TelegramCallbackQuery {
+  id: string;
+  from: TelegramUser;
+  message?: TelegramMessage;
+  data?: string;
+}
+
 interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
 }
 
 interface TelegramFile {
@@ -89,13 +106,14 @@ interface TelegramFile {
 export class TelegramAdapter implements ChannelAdapter {
   readonly channel = "telegram" as const;
 
-  private handler?: MessageHandler;
+  private handlers?: AdapterEventHandlers;
   private stopped = false;
   private pollingPromise?: Promise<void>;
   private currentPollingRequest?: http.ClientRequest;
   private nextUpdateOffset?: number;
   private botUserId?: number;
   private botUsername?: string;
+  private readonly approvalPromptRefs = new Map<string, Array<{ conversationId: string; messageId: string }>>();
 
   constructor(
     private readonly config: TelegramTransportConfig,
@@ -107,8 +125,8 @@ export class TelegramAdapter implements ChannelAdapter {
     return this.config.id;
   }
 
-  async start(handler: MessageHandler): Promise<void> {
-    this.handler = handler;
+  async start(handlers: AdapterEventHandlers): Promise<void> {
+    this.handlers = handlers;
     this.stopped = false;
 
     const me = await this.requestJson<TelegramUser>("getMe", {});
@@ -132,7 +150,7 @@ export class TelegramAdapter implements ChannelAdapter {
 
   async stop(): Promise<void> {
     this.stopped = true;
-    this.handler = undefined;
+    this.handlers = undefined;
     this.currentPollingRequest?.destroy();
     await this.pollingPromise;
     this.pollingPromise = undefined;
@@ -228,6 +246,72 @@ export class TelegramAdapter implements ChannelAdapter {
     };
   }
 
+  getFeatures(): AdapterFeatures {
+    return {
+      approvalTextCommands: false,
+      approvalInteractive: true,
+    };
+  }
+
+  async sendApprovalPrompt(prompt: ApprovalPrompt): Promise<void> {
+    const result = await this.requestJson<{ message_id: number }>("sendMessage", {
+      chat_id: normalizeChatId(prompt.conversationId),
+      text: [
+        `CodexClaw approval ${prompt.approvalId}`,
+        `Kind: ${prompt.kind}`,
+        `Summary: ${prompt.summary}`,
+      ].join("\n"),
+      reply_markup: {
+        inline_keyboard: buildApprovalInlineKeyboard(prompt.approvalId, prompt.actions),
+      },
+    });
+
+    const refs = this.approvalPromptRefs.get(prompt.approvalId) ?? [];
+    refs.push({
+      conversationId: prompt.conversationId,
+      messageId: String(result.message_id),
+    });
+    this.approvalPromptRefs.set(prompt.approvalId, refs);
+
+    this.logger.info("Sent Telegram approval prompt", {
+      adapterId: this.id,
+      conversationId: prompt.conversationId,
+      approvalId: prompt.approvalId,
+      messageId: result.message_id,
+    });
+  }
+
+  async finalizeApprovalPrompt(update: ApprovalPromptUpdate): Promise<void> {
+    const refs = this.approvalPromptRefs.get(update.approvalId) ?? [];
+    if (update.conversationId && update.messageId) {
+      refs.push({
+        conversationId: update.conversationId,
+        messageId: update.messageId,
+      });
+    }
+
+    const uniqueRefs = dedupeApprovalPromptRefs(refs);
+    this.approvalPromptRefs.delete(update.approvalId);
+
+    await Promise.all(uniqueRefs.map(async (ref) => {
+      try {
+        await this.requestJson("editMessageText", {
+          chat_id: normalizeChatId(ref.conversationId),
+          message_id: Number(ref.messageId),
+          text: formatApprovalUpdateText(update),
+        });
+      } catch (error) {
+        this.logger.warn("Failed to update Telegram approval prompt", {
+          adapterId: this.id,
+          approvalId: update.approvalId,
+          conversationId: ref.conversationId,
+          messageId: ref.messageId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }));
+  }
+
   private async runPollingLoop(): Promise<void> {
     while (!this.stopped) {
       try {
@@ -259,6 +343,11 @@ export class TelegramAdapter implements ChannelAdapter {
   }
 
   private async handleUpdate(update: TelegramUpdate): Promise<void> {
+    if (update.callback_query) {
+      await this.handleCallbackQuery(update);
+      return;
+    }
+
     if (!update.message) {
       this.logger.debug("Ignoring unsupported Telegram update", {
         adapterId: this.id,
@@ -268,7 +357,7 @@ export class TelegramAdapter implements ChannelAdapter {
       return;
     }
 
-    if (!this.handler) {
+    if (!this.handlers?.onMessage) {
       this.logger.warn("Received Telegram update before adapter handler was ready", {
         adapterId: this.id,
         updateId: update.update_id,
@@ -297,7 +386,49 @@ export class TelegramAdapter implements ChannelAdapter {
       textPreview: previewText(message.text),
     });
 
-    await this.handler(message);
+    await this.handlers.onMessage(message);
+    this.nextUpdateOffset = update.update_id + 1;
+  }
+
+  private async handleCallbackQuery(update: TelegramUpdate): Promise<void> {
+    const callbackQuery = update.callback_query;
+    if (!callbackQuery) {
+      return;
+    }
+
+    const action = parseApprovalCallbackData(callbackQuery.data);
+    if (!action || !callbackQuery.message) {
+      this.logger.debug("Ignoring unsupported Telegram callback query", {
+        adapterId: this.id,
+        updateId: update.update_id,
+      });
+      this.nextUpdateOffset = update.update_id + 1;
+      return;
+    }
+
+    if (!this.handlers?.onApprovalAction) {
+      this.logger.warn("Received Telegram callback query before approval handler was ready", {
+        adapterId: this.id,
+        updateId: update.update_id,
+      });
+      return;
+    }
+
+    await this.handlers.onApprovalAction({
+      adapterId: this.id,
+      channel: this.channel,
+      conversationId: String(callbackQuery.message.chat.id),
+      senderId: String(callbackQuery.from.id),
+      senderName: formatTelegramUser(callbackQuery.from),
+      approvalId: action.approvalId,
+      action: action.action,
+      messageId: String(callbackQuery.message.message_id),
+      raw: callbackQuery,
+    });
+
+    await this.requestJson("answerCallbackQuery", {
+      callback_query_id: callbackQuery.id,
+    });
     this.nextUpdateOffset = update.update_id + 1;
   }
 
@@ -544,13 +675,7 @@ function formatConversationName(chat: TelegramChat): string | undefined {
 
 function formatSenderName(message: TelegramMessage): string {
   if (message.from) {
-    const fullName = [message.from.first_name, message.from.last_name]
-      .map((value) => value?.trim())
-      .filter((value): value is string => Boolean(value))
-      .join(" ")
-      .trim();
-
-    return fullName || message.from.username || String(message.from.id);
+    return formatTelegramUser(message.from);
   }
 
   if (message.sender_chat?.title?.trim()) {
@@ -558,6 +683,139 @@ function formatSenderName(message: TelegramMessage): string {
   }
 
   return "unknown";
+}
+
+function formatTelegramUser(user: TelegramUser): string {
+  const fullName = [user.first_name, user.last_name]
+    .map((value) => value?.trim())
+    .filter((value): value is string => Boolean(value))
+    .join(" ")
+    .trim();
+
+  return fullName || user.username || String(user.id);
+}
+
+function buildApprovalInlineKeyboard(
+  approvalId: string,
+  actions: Array<"approve_once" | "approve_session" | "deny" | "cancel">,
+): Array<Array<{ text: string; callback_data: string }>> {
+  const buttons = actions.map((action) => ({
+    text: approvalButtonText(action),
+    callback_data: buildApprovalCallbackData(approvalId, action),
+  }));
+
+  return [buttons];
+}
+
+function buildApprovalCallbackData(
+  approvalId: string,
+  action: "approve_once" | "approve_session" | "deny" | "cancel",
+): string {
+  const callbackData = `ca:${approvalId}:${encodeApprovalAction(action)}`;
+  if (callbackData.length > 64) {
+    throw new Error(`Telegram approval callback data exceeds 64 bytes for approval ${approvalId}`);
+  }
+
+  return callbackData;
+}
+
+function encodeApprovalAction(action: "approve_once" | "approve_session" | "deny" | "cancel"): string {
+  switch (action) {
+    case "approve_once":
+      return "o";
+    case "approve_session":
+      return "s";
+    case "deny":
+      return "d";
+    case "cancel":
+      return "c";
+  }
+}
+
+function approvalButtonText(action: "approve_once" | "approve_session" | "deny" | "cancel"): string {
+  switch (action) {
+    case "approve_once":
+      return "Approve once";
+    case "approve_session":
+      return "Approve session";
+    case "deny":
+      return "Deny";
+    case "cancel":
+      return "Cancel";
+  }
+}
+
+function parseApprovalCallbackData(data?: string): { approvalId: string; action: "approve_once" | "approve_session" | "deny" | "cancel" } | null {
+  if (!data) {
+    return null;
+  }
+
+  const compactMatch = data.match(/^ca:([A-Za-z0-9_-]+):([osdc])$/);
+  if (compactMatch) {
+    return {
+      approvalId: compactMatch[1]!,
+      action: decodeApprovalAction(compactMatch[2]!),
+    };
+  }
+
+  const legacyMatch = data.match(/^codexclaw:approval:([A-Za-z0-9_-]+):(approve_once|approve_session|deny|cancel)$/i);
+  if (!legacyMatch) {
+    return null;
+  }
+
+  return {
+    approvalId: legacyMatch[1]!,
+    action: legacyMatch[2]!.toLowerCase() as "approve_once" | "approve_session" | "deny" | "cancel",
+  };
+}
+
+function decodeApprovalAction(code: string): "approve_once" | "approve_session" | "deny" | "cancel" {
+  switch (code) {
+    case "o":
+      return "approve_once";
+    case "s":
+      return "approve_session";
+    case "d":
+      return "deny";
+    case "c":
+      return "cancel";
+    default:
+      throw new Error(`Unsupported approval action code: ${code}`);
+  }
+}
+
+function formatApprovalUpdateText(update: ApprovalPromptUpdate): string {
+  const actorSuffix = update.actorName ? ` by ${update.actorName}` : "";
+
+  switch (update.status) {
+    case "approved":
+      if (update.action === "approve_session") {
+        return `Approval ${update.approvalId} approved for this session${actorSuffix}.`;
+      }
+      return `Approval ${update.approvalId} approved once${actorSuffix}.`;
+    case "denied":
+      return `Approval ${update.approvalId} denied${actorSuffix}.`;
+    case "canceled":
+      return `Approval ${update.approvalId} canceled${actorSuffix}.`;
+  }
+}
+
+function dedupeApprovalPromptRefs(
+  refs: Array<{ conversationId: string; messageId: string }>,
+): Array<{ conversationId: string; messageId: string }> {
+  const seen = new Set<string>();
+  const unique: Array<{ conversationId: string; messageId: string }> = [];
+
+  for (const ref of refs) {
+    const key = `${ref.conversationId}:${ref.messageId}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(ref);
+  }
+
+  return unique;
 }
 
 function normalizeTelegramAttachments(message: TelegramMessage): Attachment[] {

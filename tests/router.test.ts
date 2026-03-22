@@ -121,3 +121,25 @@ test("SessionRouter recognizes Telegram admin conversations", () => {
   assert.equal(result?.kind, "admin");
   assert.deepEqual(result?.allowedSenderIds, ["111"]);
 });
+
+test("SessionRouter can treat one Telegram chat as both user and admin", () => {
+  const router = createRouter({
+    allowRules: [
+      {
+        kind: "conversation",
+        transportId: "primary-telegram",
+        conversationId: "555",
+      },
+    ],
+    admins: [
+      {
+        transportId: "primary-telegram",
+        conversationId: "555",
+        allowedSenderIds: ["111"],
+      },
+    ],
+  });
+
+  assert.equal(router.matchUser(message({ conversationId: "555" }))?.kind, "user");
+  assert.equal(router.matchAdmin(message({ conversationId: "555" }))?.kind, "admin");
+});

@@ -1,6 +1,14 @@
 import { strict as assert } from "assert";
 import { Gateway } from "../src/runtime/gateway";
-import type { ChannelAdapter, Attachment, InboundMessage, MessageHandler, OutboundMessage } from "../src/adapters/base";
+import type {
+  AdapterEventHandlers,
+  AdapterFeatures,
+  ApprovalPrompt,
+  ChannelAdapter,
+  Attachment,
+  InboundMessage,
+  OutboundMessage,
+} from "../src/adapters/base";
 import type { CodexClawConfig } from "../src/config/schema";
 import type { ApprovalRequest, ApprovalRequestHandler } from "../src/codex/appServerClient";
 import { test } from "./helpers/harness";
@@ -8,27 +16,33 @@ import { TestLogger } from "./helpers/testLogger";
 
 class FakeAdapter implements ChannelAdapter {
   readonly sentMessages: OutboundMessage[] = [];
-  private handler?: MessageHandler;
+  readonly approvalPrompts: Array<Record<string, unknown>> = [];
+  private handlers?: AdapterEventHandlers;
+  features: AdapterFeatures = {
+    approvalTextCommands: false,
+    approvalInteractive: false,
+  };
+  approvalPromptError?: Error;
 
   constructor(
     readonly id: string,
     readonly channel: "imessage" | "telegram",
   ) {}
 
-  async start(handler: MessageHandler): Promise<void> {
-    this.handler = handler;
+  async start(handlers: AdapterEventHandlers): Promise<void> {
+    this.handlers = handlers;
   }
 
   async stop(): Promise<void> {
-    this.handler = undefined;
+    this.handlers = undefined;
   }
 
   async emit(message: InboundMessage): Promise<void> {
-    if (!this.handler) {
+    if (!this.handlers?.onMessage) {
       throw new Error("adapter not started");
     }
 
-    await this.handler(message);
+    await this.handlers.onMessage(message);
   }
 
   async sendMessage(message: OutboundMessage): Promise<void> {
@@ -38,10 +52,23 @@ class FakeAdapter implements ChannelAdapter {
   async materializeAttachment(attachment: Attachment): Promise<Attachment> {
     return attachment;
   }
+
+  getFeatures(): AdapterFeatures {
+    return this.features;
+  }
+
+  async sendApprovalPrompt(prompt: ApprovalPrompt): Promise<void> {
+    if (this.approvalPromptError) {
+      throw this.approvalPromptError;
+    }
+
+    this.approvalPrompts.push(prompt as unknown as Record<string, unknown>);
+  }
 }
 
 class FakeCodexClient {
   approvalHandler?: ApprovalRequestHandler;
+  resolvedApprovals: Array<{ requestId: string; decision: string }> = [];
 
   setApprovalRequestHandler(handler: ApprovalRequestHandler): void {
     this.approvalHandler = handler;
@@ -51,12 +78,15 @@ class FakeCodexClient {
   async createThread(): Promise<string> { return "thread"; }
   async resumeThread(threadId: string): Promise<string> { return threadId; }
   async runTurn(): Promise<never> { throw new Error("not used"); }
-  async resolveApproval(): Promise<void> {}
+  async resolveApproval(requestId: string, decision: string): Promise<void> {
+    this.resolvedApprovals.push({ requestId, decision });
+  }
 }
 
 class FakeStore {
   approvals: Array<Record<string, unknown>> = [];
   enqueuedMessages: InboundMessage[] = [];
+  enqueuedPayloads: string[] = [];
 
   async getChatSession(): Promise<undefined> { return undefined; }
   async saveChatSession(): Promise<void> {}
@@ -80,8 +110,11 @@ class FakeStore {
   }
   async getApproval(): Promise<undefined> { return undefined; }
   async updateApproval(): Promise<void> {}
-  async enqueueInboundMessage(input: { message: InboundMessage }): Promise<boolean> {
+  async enqueueInboundMessage(input: { message: InboundMessage; payloadJson?: string }): Promise<boolean> {
     this.enqueuedMessages.push(input.message);
+    if (input.payloadJson) {
+      this.enqueuedPayloads.push(input.payloadJson);
+    }
     return true;
   }
   async claimNextQueuedInboundMessage(): Promise<undefined> { return undefined; }
@@ -173,32 +206,39 @@ function createGatewayHarness() {
   const codex = new FakeCodexClient();
   const store = new FakeStore();
   const config = buildConfig();
+  const routerStub = {
+    match(message: InboundMessage) {
+      return routerStub.matchAdmin(message) ?? routerStub.matchUser(message);
+    },
+    matchUser(_message?: InboundMessage) {
+      return {
+        kind: "user" as const,
+        workspace: config.workspaces[0]!,
+      };
+    },
+    matchAdmin(message: InboundMessage) {
+      if (!config.admins.some((admin) =>
+        admin.transportId === message.adapterId && admin.conversationId === message.conversationId
+      )) {
+        return undefined;
+      }
+
+      return {
+        kind: "admin" as const,
+        workspace: config.workspaces[0]!,
+        label: "admin",
+        allowedSenderIds: config.admins.find((admin) =>
+          admin.transportId === message.adapterId && admin.conversationId === message.conversationId
+        )?.allowedSenderIds,
+      };
+    },
+    async getOrCreateChatSession() { throw new Error("not used"); },
+  };
 
   const gateway = new Gateway(
     config,
     [imessageAdapter, telegramAdapter],
-    {
-      match(message: InboundMessage) {
-        if (config.admins.some((admin) =>
-          admin.transportId === message.adapterId && admin.conversationId === message.conversationId
-        )) {
-          return {
-            kind: "admin" as const,
-            workspace: config.workspaces[0]!,
-            label: "admin",
-            allowedSenderIds: config.admins.find((admin) =>
-              admin.transportId === message.adapterId && admin.conversationId === message.conversationId
-            )?.allowedSenderIds,
-          };
-        }
-
-        return {
-          kind: "user" as const,
-          workspace: config.workspaces[0]!,
-        };
-      },
-      async getOrCreateChatSession() { throw new Error("not used"); },
-    } as never,
+    routerStub as never,
     {
       enqueue: async (_key: string, task: () => Promise<void>) => {
         await task();
@@ -262,6 +302,34 @@ test("Gateway sends approval prompts to all configured admin conversations", asy
   assert.equal(store.approvals.length, 1);
 });
 
+test("Gateway declines approvals cleanly when interactive approval delivery fails everywhere", async () => {
+  const { gateway, codex, telegramAdapter, config } = createGatewayHarness();
+  config.admins = [{
+    transportId: "primary-telegram",
+    conversationId: "123456",
+    allowedSenderIds: ["123456"],
+    commandFormat: "strict",
+  }];
+  telegramAdapter.features = {
+    approvalTextCommands: false,
+    approvalInteractive: true,
+  };
+  telegramAdapter.approvalPromptError = new Error("Bad Request: BUTTON_DATA_INVALID");
+
+  await gateway.start();
+  await codex.approvalHandler?.({
+    requestId: "req-telegram",
+    kind: "command",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    itemId: "item-1",
+    summary: "Run tests",
+    payload: {},
+  } satisfies ApprovalRequest);
+
+  assert.deepEqual(codex.resolvedApprovals, [{ requestId: "req-telegram", decision: "decline" }]);
+});
+
 test("Gateway allows Telegram direct messages when transport trigger is none", async () => {
   const { gateway, store, telegramAdapter } = createGatewayHarness();
   await gateway.start();
@@ -293,6 +361,39 @@ test("Gateway requires addressed Telegram group messages when transport trigger 
 
   assert.equal(store.enqueuedMessages.length, 1);
   assert.equal(store.enqueuedMessages[0]?.messageId, "2");
+});
+
+test("Gateway keeps Telegram shared user/admin chats on the user path because admin actions use buttons, not text commands", async () => {
+  const { gateway, store, telegramAdapter, config } = createGatewayHarness();
+  config.allow.push({
+    kind: "conversation",
+    transportId: "primary-telegram",
+    conversationId: "123456",
+    label: "my Telegram DM",
+  });
+
+  await gateway.start();
+
+  await telegramAdapter.emit(inboundMessage({
+    conversationId: "123456",
+    senderId: "123456",
+    text: "hello",
+  }));
+  await telegramAdapter.emit(inboundMessage({
+    messageId: "admin-2",
+    conversationId: "123456",
+    senderId: "123456",
+    text: "APPROVE APPR_1",
+  }));
+
+  assert.equal(store.enqueuedMessages.length, 2);
+  const firstPayload = JSON.parse(store.enqueuedPayloads[0] ?? "{}") as { context?: { kind?: string }, message?: { text?: string } };
+  const secondPayload = JSON.parse(store.enqueuedPayloads[1] ?? "{}") as { context?: { kind?: string }, message?: { text?: string } };
+
+  assert.equal(firstPayload.message?.text, "hello");
+  assert.equal(firstPayload.context?.kind, "user");
+  assert.equal(secondPayload.message?.text, "APPROVE APPR_1");
+  assert.equal(secondPayload.context?.kind, "user");
 });
 
 test("Gateway requires explicit @alias addressing on iMessage direct messages when trigger is addressed", async () => {

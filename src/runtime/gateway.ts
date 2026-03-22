@@ -1,5 +1,10 @@
 import { promises as fs } from "fs";
-import type { ChannelAdapter, InboundMessage } from "../adapters/base";
+import type {
+  ApprovalAction,
+  ApprovalActionEvent,
+  ChannelAdapter,
+  InboundMessage,
+} from "../adapters/base";
 import type { CodexClawConfig } from "../config/schema";
 import { parseAdminCommand } from "../core/approvalCommands";
 import type { AppServerClient, ApprovalDecision, ApprovalRequest } from "../codex/appServerClient";
@@ -45,7 +50,10 @@ export class Gateway {
 
     await Promise.all(
       Array.from(this.adaptersById.values()).map((adapter) =>
-        adapter.start((message) => this.handleInboundMessage(message)),
+        adapter.start({
+          onMessage: (message) => this.handleInboundMessage(message),
+          onApprovalAction: (action) => this.handleApprovalAction(action),
+        }),
       ),
     );
 
@@ -128,22 +136,53 @@ export class Gateway {
       return;
     }
 
-    const lines = [
-      `CodexClaw approval ${approval.id}`,
-      `Kind: ${request.kind}`,
-      `Summary: ${request.summary}`,
-      `Reply with: APPROVE ${approval.id}, APPROVE ${approval.id} SESSION, DENY ${approval.id}, or CANCEL ${approval.id}`,
-    ];
-
-    await Promise.all(
-      this.config.admins.map((admin) =>
-        this.sendMessage(
-          admin.transportId,
-          admin.conversationId,
-          lines.join("\n"),
-        ),
-      ),
+    const promptResults = await Promise.allSettled(
+      this.config.admins.map((admin) => this.sendApprovalPrompt(admin.transportId, {
+        conversationId: admin.conversationId,
+        approvalId: approval.id,
+        kind: request.kind,
+        summary: request.summary,
+        actions: ["approve_once", "approve_session", "deny"],
+      })),
     );
+
+    const failures: Array<{
+      admin: CodexClawConfig["admins"][number];
+      reason: unknown;
+    }> = [];
+    promptResults.forEach((result, index) => {
+      if (result.status === "rejected") {
+        failures.push({
+          admin: this.config.admins[index]!,
+          reason: result.reason,
+        });
+      }
+    });
+
+    for (const failure of failures) {
+      this.logger.warn("Failed to deliver approval prompt", {
+        transportId: failure.admin.transportId,
+        conversationId: failure.admin.conversationId,
+        approvalId: approval.id,
+        error: failure.reason instanceof Error ? failure.reason.message : String(failure.reason),
+      });
+    }
+
+    const delivered = promptResults.some((result) => result.status === "fulfilled");
+    if (!delivered) {
+      this.logger.error("Declining approval because delivery failed for every admin route", {
+        approvalId: approval.id,
+        requestId: request.requestId,
+        kind: request.kind,
+        threadId: request.threadId,
+        turnId: request.turnId,
+      });
+      await this.codex.resolveApproval(approval.requestId, "decline");
+      await this.store.updateApproval(approval.id, {
+        status: "denied",
+        decidedAt: new Date().toISOString(),
+      });
+    }
   }
 
   private async handleAdminMessage(message: InboundMessage, context: RouteContext): Promise<void> {
@@ -178,24 +217,60 @@ export class Gateway {
       return;
     }
 
-    const decision = toDecision(command.action, "scope" in command ? command.scope : undefined);
-    const nextStatus = toApprovalStatus(decision);
-
-    await this.codex.resolveApproval(approval.requestId, decision);
-    await this.store.updateApproval(approval.id, {
-      status: nextStatus,
-      decidedAt: new Date().toISOString(),
-    });
-
-    await this.sendMessage(
-      message.adapterId,
-      message.conversationId,
-      `Approval ${approval.id} ${nextStatus}.`,
+    await this.resolveApprovalAction(
+      approval,
+      toAction(command.action, "scope" in command ? command.scope : undefined),
+      {
+        adapterId: message.adapterId,
+        conversationId: message.conversationId,
+        senderId: message.senderId,
+        senderName: message.senderName,
+        messageId: message.messageId,
+      },
     );
   }
 
+  private async handleApprovalAction(action: ApprovalActionEvent): Promise<void> {
+    const admin = this.config.admins.find((candidate) =>
+      candidate.transportId === action.adapterId && candidate.conversationId === action.conversationId,
+    );
+
+    if (!admin || !admin.allowedSenderIds.includes(action.senderId)) {
+      this.logger.warn("Ignoring interactive approval action from unauthorized sender", {
+        adapterId: action.adapterId,
+        conversationId: action.conversationId,
+        senderId: action.senderId,
+        approvalId: action.approvalId,
+      });
+      return;
+    }
+
+    const approval = await this.store.getApproval(action.approvalId);
+    if (!approval) {
+      this.logger.warn("Ignoring approval action for unknown approval id", {
+        adapterId: action.adapterId,
+        conversationId: action.conversationId,
+        approvalId: action.approvalId,
+      });
+      return;
+    }
+
+    if (approval.status !== "pending") {
+      await this.finalizeApprovalPrompts(approval.id, approval.status, action);
+      return;
+    }
+
+    await this.resolveApprovalAction(approval, action.action, action);
+  }
+
   private prepareInboundPayload(message: InboundMessage): QueuedInboundPayload | undefined {
-    const context = this.router.match(message);
+    const adminContext = this.router.matchAdmin(message);
+    const adminCommand = adminContext && this.supportsTextApprovalCommands(message.adapterId)
+      ? parseAdminCommand(message.text)
+      : null;
+    const context = adminCommand
+      ? adminContext
+      : this.router.matchUser(message) ?? adminContext;
 
     if (!context) {
       this.logger.debug("Ignoring message rejected by policy", {
@@ -211,6 +286,16 @@ export class Gateway {
     }
 
     if (context.kind === "admin") {
+      if (!adminCommand) {
+        this.logger.debug("Ignoring non-command message in admin conversation", {
+          adapterId: message.adapterId,
+          conversationId: message.conversationId,
+          senderId: message.senderId,
+          textPreview: previewText(message.text),
+        });
+        return undefined;
+      }
+
       return { message, context };
     }
 
@@ -539,6 +624,105 @@ export class Gateway {
     await adapter.sendMessage({ conversationId, text, attachments });
   }
 
+  private async sendApprovalPrompt(
+    adapterId: string,
+    prompt: {
+      conversationId: string;
+      approvalId: string;
+      kind: "command" | "fileChange" | "permissions";
+      summary: string;
+      actions: ApprovalAction[];
+    },
+  ): Promise<void> {
+    const adapter = this.adaptersById.get(adapterId);
+    if (!adapter) {
+      throw new Error(`Unknown adapter: ${adapterId}`);
+    }
+
+    if (adapter.getFeatures().approvalInteractive && adapter.sendApprovalPrompt) {
+      await adapter.sendApprovalPrompt(prompt);
+      return;
+    }
+
+    const lines = [
+      `CodexClaw approval ${prompt.approvalId}`,
+      `Kind: ${prompt.kind}`,
+      `Summary: ${prompt.summary}`,
+      `Reply with: APPROVE ${prompt.approvalId}, APPROVE ${prompt.approvalId} SESSION, DENY ${prompt.approvalId}, or CANCEL ${prompt.approvalId}`,
+    ];
+
+    await adapter.sendMessage({
+      conversationId: prompt.conversationId,
+      text: lines.join("\n"),
+    });
+  }
+
+  private supportsTextApprovalCommands(adapterId: string): boolean {
+    return this.adaptersById.get(adapterId)?.getFeatures().approvalTextCommands === true;
+  }
+
+  private async resolveApprovalAction(
+    approval: ApprovalRecord,
+    action: ApprovalAction,
+    actor: Pick<ApprovalActionEvent, "adapterId" | "senderId" | "senderName" | "conversationId" | "messageId">,
+  ): Promise<void> {
+    const decision = toDecisionFromAction(action);
+    const nextStatus = toApprovalStatus(decision);
+
+    await this.codex.resolveApproval(approval.requestId, decision);
+    await this.store.updateApproval(approval.id, {
+      status: nextStatus,
+      decidedAt: new Date().toISOString(),
+    });
+
+    await this.finalizeApprovalPrompts(approval.id, nextStatus, {
+      ...actor,
+      action,
+    });
+  }
+
+  private async finalizeApprovalPrompts(
+    approvalId: string,
+    status: ApprovalRecord["status"],
+    actor: Pick<ApprovalActionEvent, "adapterId" | "senderId" | "senderName" | "conversationId" | "messageId" | "action">,
+  ): Promise<void> {
+    if (status === "pending") {
+      return;
+    }
+
+    const completionStatus = status === "approved" || status === "denied" || status === "canceled"
+      ? status
+      : undefined;
+    if (!completionStatus) {
+      return;
+    }
+
+    await Promise.all(this.config.admins.map(async (admin) => {
+      const adapter = this.adaptersById.get(admin.transportId);
+      if (!adapter) {
+        return;
+      }
+
+      if (adapter.finalizeApprovalPrompt) {
+        await adapter.finalizeApprovalPrompt({
+          approvalId,
+          status: completionStatus,
+          action: actor.action,
+          actorId: actor.senderId,
+          actorName: actor.senderName,
+          conversationId: admin.transportId === actor.adapterId ? actor.conversationId : undefined,
+          messageId: admin.transportId === actor.adapterId ? actor.messageId : undefined,
+        });
+        return;
+      }
+
+      await adapter.sendMessage({
+        conversationId: admin.conversationId,
+        text: formatApprovalStatusMessage(approvalId, completionStatus, actor.action, actor.senderName),
+      });
+    }));
+  }
+
   private triggerModeFor(message: InboundMessage): "none" | "addressed" {
     const transport = this.transportsById.get(message.adapterId);
     if (!transport) {
@@ -622,16 +806,29 @@ export class Gateway {
   }
 }
 
-function toDecision(action: "approve" | "deny" | "cancel", scope?: "turn" | "session"): ApprovalDecision {
+function toAction(action: "approve" | "deny" | "cancel", scope?: "turn" | "session"): ApprovalAction {
   if (action === "approve") {
-    return scope === "session" ? "acceptForSession" : "accept";
+    return scope === "session" ? "approve_session" : "approve_once";
   }
 
   if (action === "deny") {
-    return "decline";
+    return "deny";
   }
 
   return "cancel";
+}
+
+function toDecisionFromAction(action: ApprovalAction): ApprovalDecision {
+  switch (action) {
+    case "approve_once":
+      return "accept";
+    case "approve_session":
+      return "acceptForSession";
+    case "deny":
+      return "decline";
+    case "cancel":
+      return "cancel";
+  }
 }
 
 function toApprovalStatus(decision: ApprovalDecision): ApprovalRecord["status"] {
@@ -643,6 +840,24 @@ function toApprovalStatus(decision: ApprovalDecision): ApprovalRecord["status"] 
       return "denied";
     case "cancel":
       return "canceled";
+  }
+}
+
+function formatApprovalStatusMessage(
+  approvalId: string,
+  status: "approved" | "denied" | "canceled",
+  action: ApprovalAction,
+  actorName: string,
+): string {
+  switch (status) {
+    case "approved":
+      return action === "approve_session"
+        ? `Approval ${approvalId} approved for this session by ${actorName}.`
+        : `Approval ${approvalId} approved once by ${actorName}.`;
+    case "denied":
+      return `Approval ${approvalId} denied by ${actorName}.`;
+    case "canceled":
+      return `Approval ${approvalId} canceled by ${actorName}.`;
   }
 }
 
