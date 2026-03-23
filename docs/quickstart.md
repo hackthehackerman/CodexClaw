@@ -22,6 +22,7 @@ This creates:
 - `~/.codexclaw/state/codexclaw.db`
 
 `codexclaw init` is interactive by default. It will walk you through a narrow first-run setup for one transport.
+If both are available, start with Telegram first. It is the simplest v0 path.
 
 If you want a project-local install instead, run:
 
@@ -68,7 +69,7 @@ conversation_id = "123456789"
 label = "my Telegram DM"
 ```
 
-If you keep `approval_policy = "untrusted"`, add yourself as an admin too:
+If you keep approvals enabled, add yourself as an admin too:
 
 ```toml
 [[admins]]
@@ -108,7 +109,7 @@ conversation_id = "any;-;+15555550123"
 label = "my iMessage DM"
 ```
 
-If you keep `approval_policy = "untrusted"`, add your admin chat:
+If you keep approvals enabled, add your admin chat:
 
 ```toml
 [[admins]]

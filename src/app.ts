@@ -17,6 +17,7 @@ export function createApp(config: CodexClawConfig, logger: Logger, configPath: s
     command: config.codex.command,
     approvalPolicy: config.codex.approvalPolicy,
     sandbox: config.codex.sandbox,
+    networkAccess: config.codex.networkAccess,
     model: config.codex.model,
     effort: config.codex.effort,
     summary: config.codex.summary,

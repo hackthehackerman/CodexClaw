@@ -103,6 +103,16 @@ interface TelegramFile {
   file_path?: string;
 }
 
+interface TelegramRequestError extends Error {
+  code?: string;
+  statusCode?: number;
+  retryAfterMs?: number;
+}
+
+const TELEGRAM_PHOTO_CAPTION_MAX_LENGTH = 1024;
+const TELEGRAM_REQUEST_MAX_ATTEMPTS = 3;
+const TELEGRAM_REQUEST_BASE_DELAY_MS = 200;
+
 export class TelegramAdapter implements ChannelAdapter {
   readonly channel = "telegram" as const;
 
@@ -158,6 +168,29 @@ export class TelegramAdapter implements ChannelAdapter {
   }
 
   async sendMessage(message: OutboundMessage): Promise<void> {
+    const captionedPhoto = selectCaptionablePhoto(message);
+    if (captionedPhoto) {
+      await this.requestMultipart(
+        "sendPhoto",
+        {
+          chat_id: normalizeChatId(message.conversationId),
+          ...(message.text.trim().length > 0 ? { caption: message.text } : {}),
+        },
+        "photo",
+        captionedPhoto.localPath!,
+        captionedPhoto.name ?? path.basename(captionedPhoto.localPath!),
+        captionedPhoto.mimeType,
+      );
+
+      this.logger.info("Sent Telegram photo", {
+        adapterId: this.id,
+        conversationId: message.conversationId,
+        localPath: captionedPhoto.localPath,
+        captionPreview: previewText(message.text),
+      });
+      return;
+    }
+
     if (message.text.trim().length > 0) {
       await this.requestJson("sendMessage", {
         chat_id: normalizeChatId(message.conversationId),
@@ -477,6 +510,71 @@ export class TelegramAdapter implements ChannelAdapter {
     body: Record<string, unknown>,
     isPollingRequest = false,
   ): Promise<T> {
+    return await this.withTelegramRetries(
+      `Telegram API ${method}`,
+      () => this.requestJsonOnce(method, body, isPollingRequest),
+      !isPollingRequest,
+    );
+  }
+
+  private async requestMultipart(
+    method: string,
+    fields: Record<string, string | number>,
+    fileFieldName: string,
+    filePath: string,
+    fileName: string,
+    mimeType?: string,
+  ): Promise<void> {
+    const body = await buildMultipartBody(fields, fileFieldName, filePath, fileName, mimeType);
+    await this.withTelegramRetries(
+      `Telegram API ${method}`,
+      () => this.requestMultipartOnce(method, body),
+    );
+  }
+
+  private async requestFile(filePath: string): Promise<{ body: Buffer; contentType?: string }> {
+    return await this.withTelegramRetries(
+      `Telegram file ${filePath}`,
+      () => this.requestFileOnce(filePath),
+    );
+  }
+
+  private async withTelegramRetries<T>(
+    operation: string,
+    task: () => Promise<T>,
+    retryable = true,
+  ): Promise<T> {
+    let attempt = 1;
+    while (true) {
+      try {
+        return await task();
+      } catch (error) {
+        const normalized = normalizeTelegramRequestError(error);
+        const wrapped = withTelegramOperationContext(operation, normalized);
+        if (!retryable || !shouldRetryTelegramRequest(normalized) || attempt >= TELEGRAM_REQUEST_MAX_ATTEMPTS) {
+          throw wrapped;
+        }
+
+        const delayMs = retryDelayMs(normalized, attempt);
+        this.logger.warn("Telegram request failed; retrying", {
+          adapterId: this.id,
+          operation,
+          attempt,
+          maxAttempts: TELEGRAM_REQUEST_MAX_ATTEMPTS,
+          delayMs,
+          error: wrapped.message,
+        });
+        await sleep(delayMs);
+        attempt += 1;
+      }
+    }
+  }
+
+  private async requestJsonOnce<T>(
+    method: string,
+    body: Record<string, unknown>,
+    isPollingRequest: boolean,
+  ): Promise<T> {
     const url = this.methodUrl(method);
     const transport = url.protocol === "http:" ? http : https;
     const payload = JSON.stringify(body);
@@ -500,12 +598,18 @@ export class TelegramAdapter implements ChannelAdapter {
 
           response.on("end", () => {
             const rawText = Buffer.concat(chunks).toString("utf8");
-            const parsed = rawText.length > 0
-              ? JSON.parse(rawText) as TelegramApiResponse<T>
-              : { ok: false, result: undefined as T, description: "Empty response" };
+            let parsed: TelegramApiResponse<T>;
+            try {
+              parsed = rawText.length > 0
+                ? JSON.parse(rawText) as TelegramApiResponse<T>
+                : { ok: false, result: undefined as T, description: "Empty response" };
+            } catch (error) {
+              reject(normalizeTelegramRequestError(error));
+              return;
+            }
 
             if ((response.statusCode ?? 500) >= 400 || !parsed.ok) {
-              reject(new Error(parsed.description ?? `Telegram API request failed (${response.statusCode ?? "unknown"})`));
+              reject(createTelegramResponseError(response.statusCode, response.headers, parsed.description));
               return;
             }
 
@@ -530,35 +634,12 @@ export class TelegramAdapter implements ChannelAdapter {
     });
   }
 
-  private async requestMultipart(
-    method: string,
-    fields: Record<string, string | number>,
-    fileFieldName: string,
-    filePath: string,
-    fileName: string,
-    mimeType?: string,
-  ): Promise<void> {
+  private async requestMultipartOnce(method: string, body: {
+    bytes: Buffer;
+    boundary: string;
+  }): Promise<void> {
     const url = this.methodUrl(method);
     const transport = url.protocol === "http:" ? http : https;
-    const boundary = `----codexclaw-telegram-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const fileContents = await fs.readFile(filePath);
-    const parts: Buffer[] = [];
-
-    for (const [key, value] of Object.entries(fields)) {
-      parts.push(Buffer.from(
-        `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${String(value)}\r\n`,
-        "utf8",
-      ));
-    }
-
-    parts.push(Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="${fileFieldName}"; filename="${escapeHeaderValue(fileName)}"\r\nContent-Type: ${mimeType ?? "application/octet-stream"}\r\n\r\n`,
-      "utf8",
-    ));
-    parts.push(fileContents);
-    parts.push(Buffer.from(`\r\n--${boundary}--\r\n`, "utf8"));
-
-    const body = Buffer.concat(parts);
 
     await new Promise<void>((resolve, reject) => {
       const request = transport.request(
@@ -566,8 +647,8 @@ export class TelegramAdapter implements ChannelAdapter {
         {
           method: "POST",
           headers: {
-            "Content-Type": `multipart/form-data; boundary=${boundary}`,
-            "Content-Length": String(body.byteLength),
+            "Content-Type": `multipart/form-data; boundary=${body.boundary}`,
+            "Content-Length": String(body.bytes.byteLength),
           },
         },
         (response) => {
@@ -579,12 +660,18 @@ export class TelegramAdapter implements ChannelAdapter {
 
           response.on("end", () => {
             const rawText = Buffer.concat(chunks).toString("utf8");
-            const parsed = rawText.length > 0
-              ? JSON.parse(rawText) as TelegramApiResponse<unknown>
-              : { ok: false, result: undefined, description: "Empty response" };
+            let parsed: TelegramApiResponse<unknown>;
+            try {
+              parsed = rawText.length > 0
+                ? JSON.parse(rawText) as TelegramApiResponse<unknown>
+                : { ok: false, result: undefined, description: "Empty response" };
+            } catch (error) {
+              reject(normalizeTelegramRequestError(error));
+              return;
+            }
 
             if ((response.statusCode ?? 500) >= 400 || !parsed.ok) {
-              reject(new Error(parsed.description ?? `Telegram API request failed (${response.statusCode ?? "unknown"})`));
+              reject(createTelegramResponseError(response.statusCode, response.headers, parsed.description));
               return;
             }
 
@@ -596,12 +683,12 @@ export class TelegramAdapter implements ChannelAdapter {
       );
 
       request.on("error", reject);
-      request.write(body);
+      request.write(body.bytes);
       request.end();
     });
   }
 
-  private async requestFile(filePath: string): Promise<{ body: Buffer; contentType?: string }> {
+  private async requestFileOnce(filePath: string): Promise<{ body: Buffer; contentType?: string }> {
     const url = this.fileUrl(filePath);
     const transport = url.protocol === "http:" ? http : https;
 
@@ -620,7 +707,7 @@ export class TelegramAdapter implements ChannelAdapter {
             const body = Buffer.concat(chunks);
 
             if ((response.statusCode ?? 500) >= 400) {
-              reject(new Error(`Telegram file download failed (${response.statusCode ?? "unknown"})`));
+              reject(createTelegramResponseError(response.statusCode, response.headers, "Telegram file download failed"));
               return;
             }
 
@@ -818,6 +905,122 @@ function dedupeApprovalPromptRefs(
   return unique;
 }
 
+function selectCaptionablePhoto(message: OutboundMessage): Attachment | undefined {
+  if ((message.attachments?.length ?? 0) !== 1) {
+    return undefined;
+  }
+
+  const [attachment] = message.attachments ?? [];
+  if (!attachment || attachment.type !== "image" || !attachment.localPath) {
+    return undefined;
+  }
+
+  if (telegramTextLength(message.text) > TELEGRAM_PHOTO_CAPTION_MAX_LENGTH) {
+    return undefined;
+  }
+
+  return attachment;
+}
+
+async function buildMultipartBody(
+  fields: Record<string, string | number>,
+  fileFieldName: string,
+  filePath: string,
+  fileName: string,
+  mimeType?: string,
+): Promise<{ bytes: Buffer; boundary: string }> {
+  const boundary = `----codexclaw-telegram-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const fileContents = await fs.readFile(filePath);
+  const parts: Buffer[] = [];
+
+  for (const [key, value] of Object.entries(fields)) {
+    parts.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${String(value)}\r\n`,
+      "utf8",
+    ));
+  }
+
+  parts.push(Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="${fileFieldName}"; filename="${escapeHeaderValue(fileName)}"\r\nContent-Type: ${mimeType ?? "application/octet-stream"}\r\n\r\n`,
+    "utf8",
+  ));
+  parts.push(fileContents);
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`, "utf8"));
+
+  return {
+    bytes: Buffer.concat(parts),
+    boundary,
+  };
+}
+
+function normalizeTelegramRequestError(error: unknown): TelegramRequestError {
+  if (error instanceof Error) {
+    return error as TelegramRequestError;
+  }
+
+  return new Error(String(error)) as TelegramRequestError;
+}
+
+function withTelegramOperationContext(operation: string, error: TelegramRequestError): TelegramRequestError {
+  if (error.message.startsWith(`${operation} failed:`)) {
+    return error;
+  }
+
+  const wrapped = new Error(`${operation} failed: ${error.message}`) as TelegramRequestError;
+  wrapped.code = error.code;
+  wrapped.statusCode = error.statusCode;
+  wrapped.retryAfterMs = error.retryAfterMs;
+  return wrapped;
+}
+
+function createTelegramResponseError(
+  statusCode: number | undefined,
+  headers: http.IncomingHttpHeaders,
+  description?: string,
+): TelegramRequestError {
+  const error = new Error(description ?? `Telegram API request failed (${statusCode ?? "unknown"})`) as TelegramRequestError;
+  error.statusCode = statusCode;
+  error.retryAfterMs = parseRetryAfterMs(headers["retry-after"]);
+  return error;
+}
+
+function parseRetryAfterMs(value: string | string[] | undefined): number | undefined {
+  const parsed = Number(Array.isArray(value) ? value[0] : value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return undefined;
+  }
+
+  return parsed * 1000;
+}
+
+function shouldRetryTelegramRequest(error: TelegramRequestError): boolean {
+  if (error.statusCode !== undefined) {
+    return error.statusCode === 408
+      || error.statusCode === 429
+      || (error.statusCode >= 500 && error.statusCode < 600);
+  }
+
+  switch (error.code) {
+    case "ECONNABORTED":
+    case "ECONNRESET":
+    case "EAI_AGAIN":
+    case "ENOTFOUND":
+    case "EPIPE":
+    case "ETIMEDOUT":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function retryDelayMs(error: TelegramRequestError, attempt: number): number {
+  if (error.retryAfterMs !== undefined) {
+    return error.retryAfterMs;
+  }
+
+  return TELEGRAM_REQUEST_BASE_DELAY_MS * (2 ** Math.max(0, attempt - 1));
+}
+
 function normalizeTelegramAttachments(message: TelegramMessage): Attachment[] {
   const attachments: Attachment[] = [];
 
@@ -962,6 +1165,10 @@ function previewText(value: string, maxLength = 80): string {
   }
 
   return `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+function telegramTextLength(value: string): number {
+  return Array.from(value).length;
 }
 
 function diffMs(start: string | undefined, end: number = Date.now()): number | undefined {

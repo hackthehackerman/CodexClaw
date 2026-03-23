@@ -7,8 +7,9 @@ allow_self_messages = false
 
 [codex]
 command = ["codex", "app-server"]
-approval_policy = "untrusted"
+approval_policy = "on-request"
 sandbox = "workspace-write"
+network_access = "restricted"
 model = "gpt-5.4"
 effort = "medium"
 summary = "concise"
@@ -55,7 +56,7 @@ default = "deny"
 # transport_id = "primary-imessage"
 # label = "all allowed iMessage groups"
 
-# Configure at least one admin route if you keep approval_policy = "untrusted".
+# Configure at least one admin route if approval_policy is not "never".
 # If no admin routes are configured, approvals are auto-declined.
 #
 # [[admins]]

@@ -73,10 +73,12 @@ async function runInit(parsed: ParsedArgs): Promise<void> {
   const baseDir = path.dirname(configPath);
   const personalityDir = path.join(baseDir, "personality");
   const soulPath = path.join(personalityDir, "soul.md");
+  const portraitPath = path.join(personalityDir, "yanny.png");
 
   if (!force) {
     await assertPathDoesNotExist(configPath, "Config file already exists");
     await assertPathDoesNotExist(soulPath, "Soul file already exists");
+    await assertPathDoesNotExist(portraitPath, "Portrait file already exists");
   }
 
   await fs.mkdir(baseDir, { recursive: true });
@@ -85,6 +87,7 @@ async function runInit(parsed: ParsedArgs): Promise<void> {
   const packageRoot = await resolvePackageRoot();
   const configTemplatePath = path.join(packageRoot, "templates", "codexclaw.toml");
   const soulTemplatePath = path.join(packageRoot, "templates", "soul.md");
+  const portraitTemplatePath = path.join(packageRoot, "templates", "yanny.png");
 
   const configTemplate = await fs.readFile(configTemplatePath, "utf8");
   const soulTemplate = await fs.readFile(soulTemplatePath, "utf8");
@@ -98,9 +101,11 @@ async function runInit(parsed: ParsedArgs): Promise<void> {
 
   await fs.writeFile(configPath, renderedConfig, "utf8");
   await fs.writeFile(soulPath, soulTemplate, "utf8");
+  await fs.copyFile(portraitTemplatePath, portraitPath);
 
   console.log(`Created ${configPath}`);
   console.log(`Created ${soulPath}`);
+  console.log(`Created ${portraitPath}`);
   console.log("");
   printInitNextSteps(configPath, preset);
 }
@@ -253,6 +258,7 @@ function printHelp(): void {
   console.log("Defaults:");
   console.log("  config: ~/.codexclaw/codexclaw.toml");
   console.log("  soul:   ~/.codexclaw/personality/soul.md");
+  console.log("  image:  ~/.codexclaw/personality/yanny.png");
   console.log("  state:  ~/.codexclaw/state/codexclaw.db");
   console.log("");
   console.log("Options:");
@@ -625,9 +631,10 @@ async function promptForInitWizard(): Promise<InitPreset> {
     console.log("- This will generate a narrow first-run config so only you can message the bot.");
     console.log(`- By default it writes to ${resolveDefaultConfigPath()}.`);
     console.log("- Start with one transport and one allowed chat.");
+    console.log("- Telegram is the fastest first setup. Use iMessage if BlueBubbles is already ready.");
     console.log("");
 
-    const transport = await promptChoice(io, "First transport", ["telegram", "imessage"]);
+    const transport = await promptChoice(io, "First transport (recommended: telegram)", ["telegram", "imessage"]);
     if (transport === "telegram") {
       return await promptForTelegramInit({}, io);
     }
@@ -840,7 +847,7 @@ function printInitNextSteps(configPath: string, preset: InitPreset): void {
   if (!hasPreset) {
     console.log(`- Edit ${configPath} and enable one transport.`);
     console.log("- Add one narrow allow rule so only you can message Yanny.");
-    console.log("- If you keep approval_policy = \"untrusted\", add an admin route.");
+    console.log("- If you keep approvals enabled, add an admin route.");
     console.log(`- Run: ${renderStartCommand(configPath)}`);
     return;
   }
@@ -869,10 +876,10 @@ function renderStartCommand(configPath: string): string {
 
 function chooseInitApprovalPolicy(preset: InitPreset): string {
   if (!inferInitTransport(preset)) {
-    return "untrusted";
+    return "on-request";
   }
 
-  return hasInitAdminRoute(preset) ? "untrusted" : "never";
+  return hasInitAdminRoute(preset) ? "on-request" : "never";
 }
 
 function hasInitAdminRoute(preset: InitPreset): boolean {

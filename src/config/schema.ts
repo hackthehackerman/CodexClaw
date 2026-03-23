@@ -13,6 +13,11 @@ export const sandboxSchema = z.enum([
   "danger-full-access",
 ]);
 
+export const networkAccessSchema = z.enum([
+  "restricted",
+  "enabled",
+]);
+
 export const reasoningEffortSchema = z.enum([
   "none",
   "minimal",
@@ -47,8 +52,9 @@ const botSchema = z.object({
 
 const codexSchema = z.object({
   command: z.array(z.string().min(1)).min(1).default(["codex", "app-server"]),
-  approvalPolicy: approvalPolicySchema.default("untrusted"),
+  approvalPolicy: approvalPolicySchema.default("on-request"),
   sandbox: sandboxSchema.default("workspace-write"),
+  networkAccess: networkAccessSchema.default("restricted"),
   model: z.string().min(1).optional(),
   effort: reasoningEffortSchema.optional(),
   summary: z.string().min(1).default("concise"),

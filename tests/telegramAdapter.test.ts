@@ -21,9 +21,18 @@ interface RecordedRequest {
 async function createTelegramApiServer(options?: {
   getUpdates?: (call: number, body: Record<string, unknown>) => unknown[];
   files?: Record<string, { bytes: Buffer; contentType?: string }>;
+  botMethodHandlers?: Record<
+    string,
+    (
+      call: number,
+      record: RecordedRequest,
+      response: http.ServerResponse,
+      request: http.IncomingMessage,
+    ) => void | Promise<void>
+  >;
 }) {
   const requests: RecordedRequest[] = [];
-  let getUpdatesCalls = 0;
+  const methodCalls = new Map<string, number>();
   const token = "test-token";
 
   const server = http.createServer(async (request, response) => {
@@ -42,6 +51,21 @@ async function createTelegramApiServer(options?: {
 
     requests.push(record);
 
+    const botMethod = url.pathname.startsWith(`/bot${token}/`)
+      ? url.pathname.slice(`/bot${token}/`.length)
+      : undefined;
+    const botMethodCall = botMethod
+      ? (methodCalls.get(botMethod) ?? 0) + 1
+      : 0;
+    if (botMethod) {
+      methodCalls.set(botMethod, botMethodCall);
+      const handler = options?.botMethodHandlers?.[botMethod];
+      if (handler) {
+        await handler(botMethodCall, record, response, request);
+        return;
+      }
+    }
+
     if (url.pathname === `/bot${token}/getMe`) {
       return respondJson(response, {
         ok: true,
@@ -55,10 +79,9 @@ async function createTelegramApiServer(options?: {
     }
 
     if (url.pathname === `/bot${token}/getUpdates`) {
-      getUpdatesCalls += 1;
       return respondJson(response, {
         ok: true,
-        result: options?.getUpdates?.(getUpdatesCalls, (record.json ?? {}) as Record<string, unknown>) ?? [],
+        result: options?.getUpdates?.(botMethodCall, (record.json ?? {}) as Record<string, unknown>) ?? [],
       });
     }
 
@@ -380,6 +403,170 @@ test("TelegramAdapter sends text, photos, and documents through Bot API methods"
     assert.ok(api.requests.some((request) => request.pathname.endsWith("/sendMessage")));
     assert.ok(api.requests.some((request) => request.pathname.endsWith("/sendPhoto")));
     assert.ok(api.requests.some((request) => request.pathname.endsWith("/sendDocument")));
+  } finally {
+    process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = previousBaseUrl;
+    await rm(tempDir, { recursive: true, force: true });
+    await api.close();
+  }
+});
+
+test("TelegramAdapter sends a single image reply as sendPhoto with caption when the text fits", async () => {
+  const api = await createTelegramApiServer();
+  const previousBaseUrl = process.env.CODEXCLAW_TELEGRAM_API_BASE_URL;
+  process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = api.baseUrl;
+
+  const adapter = createAdapter(api.token);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codexclaw-telegram-caption-"));
+
+  try {
+    await adapter.start({
+      onMessage: async () => undefined,
+    });
+
+    const imagePath = path.join(tempDir, "image.png");
+    await writeFile(imagePath, "image-bytes", "utf8");
+
+    await adapter.sendMessage({
+      conversationId: "12345",
+      text: "hello telegram",
+      attachments: [
+        { type: "image", localPath: imagePath, name: "image.png", mimeType: "image/png" },
+      ],
+    });
+
+    await adapter.stop();
+
+    const sendPhotoRequests = api.requests.filter((request) => request.pathname.endsWith("/sendPhoto"));
+    assert.equal(sendPhotoRequests.length, 1);
+    assert.equal(api.requests.some((request) => request.pathname.endsWith("/sendMessage")), false);
+    assert.match(sendPhotoRequests[0]!.body.toString("utf8"), /name="caption"\r\n\r\nhello telegram\r\n/);
+  } finally {
+    process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = previousBaseUrl;
+    await rm(tempDir, { recursive: true, force: true });
+    await api.close();
+  }
+});
+
+test("TelegramAdapter falls back to sendMessage before sendPhoto when the text is too long for a caption", async () => {
+  const api = await createTelegramApiServer();
+  const previousBaseUrl = process.env.CODEXCLAW_TELEGRAM_API_BASE_URL;
+  process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = api.baseUrl;
+
+  const adapter = createAdapter(api.token);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codexclaw-telegram-long-caption-"));
+
+  try {
+    await adapter.start({
+      onMessage: async () => undefined,
+    });
+
+    const imagePath = path.join(tempDir, "image.png");
+    await writeFile(imagePath, "image-bytes", "utf8");
+
+    await adapter.sendMessage({
+      conversationId: "12345",
+      text: "x".repeat(1025),
+      attachments: [
+        { type: "image", localPath: imagePath, name: "image.png", mimeType: "image/png" },
+      ],
+    });
+
+    await adapter.stop();
+
+    assert.ok(api.requests.some((request) => request.pathname.endsWith("/sendMessage")));
+    assert.ok(api.requests.some((request) => request.pathname.endsWith("/sendPhoto")));
+  } finally {
+    process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = previousBaseUrl;
+    await rm(tempDir, { recursive: true, force: true });
+    await api.close();
+  }
+});
+
+test("TelegramAdapter retries transient sendPhoto connection resets", async () => {
+  const api = await createTelegramApiServer({
+    botMethodHandlers: {
+      sendPhoto(call, _record, response, request) {
+        if (call === 1) {
+          request.socket.destroy();
+          return;
+        }
+
+        respondJson(response, { ok: true, result: { message_id: 1 } });
+      },
+    },
+  });
+  const previousBaseUrl = process.env.CODEXCLAW_TELEGRAM_API_BASE_URL;
+  process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = api.baseUrl;
+
+  const adapter = createAdapter(api.token);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codexclaw-telegram-retry-"));
+
+  try {
+    await adapter.start({
+      onMessage: async () => undefined,
+    });
+
+    const imagePath = path.join(tempDir, "image.png");
+    await writeFile(imagePath, "image-bytes", "utf8");
+
+    await adapter.sendMessage({
+      conversationId: "12345",
+      text: "hello telegram",
+      attachments: [
+        { type: "image", localPath: imagePath, name: "image.png", mimeType: "image/png" },
+      ],
+    });
+
+    await adapter.stop();
+
+    assert.equal(api.requests.filter((request) => request.pathname.endsWith("/sendPhoto")).length, 2);
+  } finally {
+    process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = previousBaseUrl;
+    await rm(tempDir, { recursive: true, force: true });
+    await api.close();
+  }
+});
+
+test("TelegramAdapter includes the Telegram method name after delivery retries are exhausted", async () => {
+  const api = await createTelegramApiServer({
+    botMethodHandlers: {
+      sendPhoto(_call, _record, response) {
+        response.statusCode = 503;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: false,
+          description: "temporary outage",
+        }));
+      },
+    },
+  });
+  const previousBaseUrl = process.env.CODEXCLAW_TELEGRAM_API_BASE_URL;
+  process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = api.baseUrl;
+
+  const adapter = createAdapter(api.token);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codexclaw-telegram-method-error-"));
+
+  try {
+    await adapter.start({
+      onMessage: async () => undefined,
+    });
+
+    const imagePath = path.join(tempDir, "image.png");
+    await writeFile(imagePath, "image-bytes", "utf8");
+
+    await assert.rejects(
+      adapter.sendMessage({
+        conversationId: "12345",
+        text: "hello telegram",
+        attachments: [
+          { type: "image", localPath: imagePath, name: "image.png", mimeType: "image/png" },
+        ],
+      }),
+      /Telegram API sendPhoto failed: temporary outage/,
+    );
+
+    assert.equal(api.requests.filter((request) => request.pathname.endsWith("/sendPhoto")).length, 3);
+    await adapter.stop();
   } finally {
     process.env.CODEXCLAW_TELEGRAM_API_BASE_URL = previousBaseUrl;
     await rm(tempDir, { recursive: true, force: true });

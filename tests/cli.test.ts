@@ -42,9 +42,16 @@ test("init can generate a narrow Telegram-only config", async () => {
       throw new Error("Expected conversation allow rule");
     }
     assert.equal(config.allow[0].conversationId, "123456789");
+    assert.equal(config.codex.approvalPolicy, "on-request");
+    assert.equal(config.codex.networkAccess, "restricted");
     assert.equal(config.admins.length, 1);
     assert.equal(config.admins[0]?.conversationId, "123456789");
     assert.deepEqual(config.admins[0]?.allowedSenderIds, ["123456789"]);
+
+    const soulText = await readFile(path.join(tempDir, "personality", "soul.md"), "utf8");
+    const portraitBytes = await readFile(path.join(tempDir, "personality", "yanny.png"));
+    assert.match(soulText, /A reference image of what you look like may be available in the personality directory as `yanny\.png`\./);
+    assert.ok(portraitBytes.length > 0);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -71,8 +78,14 @@ test("interactive init can guide a Telegram-only setup", async () => {
       throw new Error("Expected conversation allow rule");
     }
     assert.equal(config.allow[0].conversationId, "123456789");
-    assert.equal(config.codex.approvalPolicy, "untrusted");
+    assert.equal(config.codex.approvalPolicy, "on-request");
+    assert.equal(config.codex.networkAccess, "restricted");
     assert.equal(config.admins.length, 1);
+
+    const soulText = await readFile(path.join(tempDir, "personality", "soul.md"), "utf8");
+    const portraitBytes = await readFile(path.join(tempDir, "personality", "yanny.png"));
+    assert.match(soulText, /A reference image of what you look like may be available in the personality directory as `yanny\.png`\./);
+    assert.ok(portraitBytes.length > 0);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

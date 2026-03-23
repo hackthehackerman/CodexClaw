@@ -137,6 +137,7 @@ function buildConfig(): CodexClawConfig {
       command: ["codex", "app-server"],
       approvalPolicy: "untrusted",
       sandbox: "workspace-write",
+      networkAccess: "restricted",
       summary: "concise",
     },
     storage: {

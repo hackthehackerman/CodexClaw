@@ -32,6 +32,8 @@ export interface TurnStartPayload extends Record<string, unknown> {
   threadId: string;
   input: Array<Record<string, unknown>>;
   cwd: string;
+  approvalPolicy?: ApprovalPolicy;
+  approvalsReviewer?: "user";
   model?: string;
   effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
   summary: string;
@@ -50,11 +52,15 @@ export interface ApprovalRequest {
 
 export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
 export type ApprovalRequestHandler = (request: ApprovalRequest) => Promise<void>;
+export type ApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "never";
+export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+export type NetworkAccess = "restricted" | "enabled";
 
 export interface AppServerClientOptions {
   command: string[];
-  approvalPolicy: "untrusted" | "on-failure" | "on-request" | "never";
-  sandbox: "read-only" | "workspace-write" | "danger-full-access";
+  approvalPolicy: ApprovalPolicy;
+  sandbox: SandboxMode;
+  networkAccess: NetworkAccess;
   model?: string;
   effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
   summary: string;
@@ -143,9 +149,10 @@ export class AppServerClient {
     this.approvalHandler = handler;
   }
 
-  applyRuntimeConfig(config: Pick<AppServerClientOptions, "approvalPolicy" | "sandbox" | "model" | "effort" | "summary">): void {
+  applyRuntimeConfig(config: Pick<AppServerClientOptions, "approvalPolicy" | "sandbox" | "networkAccess" | "model" | "effort" | "summary">): void {
     this.options.approvalPolicy = config.approvalPolicy;
     this.options.sandbox = config.sandbox;
+    this.options.networkAccess = config.networkAccess;
     this.options.model = config.model;
     this.options.effort = config.effort;
     this.options.summary = config.summary;
@@ -271,6 +278,8 @@ export class AppServerClient {
       threadId: request.threadId,
       input,
       cwd: request.workspaceCwd,
+      approvalPolicy: this.options.approvalPolicy,
+      approvalsReviewer: "user",
       model: this.options.model,
       effort: this.options.effort,
       summary: this.options.summary,
@@ -673,18 +682,33 @@ export class AppServerClient {
 
   private async buildThreadParams(context: ThreadInitContext): Promise<Record<string, unknown>> {
     const developerInstructions = await buildDeveloperInstructions(context.soulPath);
+    const config = this.buildSandboxConfigOverride();
 
     return {
       cwd: context.workspaceCwd,
       approvalPolicy: this.options.approvalPolicy,
       approvalsReviewer: "user",
       sandbox: this.options.sandbox,
+      ...(config ? { config } : {}),
       model: this.options.model,
       developerInstructions,
       personality: "none",
       serviceName: "codexclaw",
       experimentalRawEvents: false,
       persistExtendedHistory: true,
+    };
+  }
+
+  private buildSandboxConfigOverride(): Record<string, unknown> | undefined {
+    if (this.options.sandbox !== "workspace-write") {
+      return undefined;
+    }
+
+    return {
+      sandbox_mode: "workspace-write",
+      sandbox_workspace_write: {
+        network_access: this.options.networkAccess === "enabled",
+      },
     };
   }
 }

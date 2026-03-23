@@ -264,7 +264,8 @@ Default posture:
 
 - `personality = "none"`
 - full custom `developer_instructions`
-- `approvalPolicy = "untrusted"` or `on-request`
+- `approvalPolicy = "on-request"`
+- restricted network inside the workspace sandbox
 - restricted sandbox
 - owner-only approval chat
 - allowlist for approved chats and senders

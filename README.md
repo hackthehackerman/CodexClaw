@@ -51,6 +51,8 @@ By default it creates and uses:
 - `~/.codexclaw/personality/soul.md`
 - `~/.codexclaw/state/codexclaw.db`
 
+If you have both options available, start with Telegram first. It is the faster, simpler v0 setup.
+
 If you want a project-local setup instead, pass `--config /path/to/codexclaw.toml` to both `init` and `start`.
 
 Environment overrides:
@@ -81,7 +83,7 @@ That means nobody can message Yanny until you explicitly configure access.
 1. Edit `~/.codexclaw/codexclaw.toml`
 2. Enable one transport
 3. Add one narrow allow rule so only you can message it
-4. If you keep `approval_policy = "untrusted"`, add an admin route
+4. If you keep approvals enabled, add an admin route
 5. Run `codexclaw start`
 
 See the full setup guide in [docs/quickstart.md](docs/quickstart.md).
@@ -119,8 +121,9 @@ Use it for:
 The recommended v0 posture is:
 - `policy.default = "deny"`
 - `allow_self_messages = false`
-- `approval_policy = "untrusted"`
+- `approval_policy = "on-request"`
 - `sandbox = "workspace-write"`
+- `network_access = "restricted"`
 - groups use `addressed` triggers unless you intentionally want ambient replies
 
 Start with one explicit chat. Widen access only after the bot is behaving the way you want.
