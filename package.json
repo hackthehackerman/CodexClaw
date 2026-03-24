@@ -1,5 +1,5 @@
 {
-  "name": "@yansen/codexclaw",
+  "name": "@yansenzhou/codexclaw",
   "version": "0.1.0",
   "description": "Thin orchestration layer on top of codex app-server.",
   "bin": {

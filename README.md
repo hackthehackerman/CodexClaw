@@ -16,7 +16,7 @@ CodexClaw is a thin orchestration layer on top of `codex app-server`. It lets yo
 ## Install
 
 ```bash
-npm install -g @yansen/codexclaw
+npm install -g @yansenzhou/codexclaw
 ```
 
 ## Quickstart

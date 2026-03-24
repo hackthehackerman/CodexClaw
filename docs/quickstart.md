@@ -5,7 +5,7 @@ This guide is the fastest safe path to a working CodexClaw install.
 ## 1. Install
 
 ```bash
-npm install -g @yansen/codexclaw
+npm install -g @yansenzhou/codexclaw
 ```
 
 Make sure `codex` is installed and already authenticated on the same machine.
