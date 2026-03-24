@@ -1,9 +1,12 @@
 {
-  "name": "codexclaw",
+  "name": "@yansen/codexclaw",
   "version": "0.1.0",
   "description": "Thin orchestration layer on top of codex app-server.",
   "bin": {
     "codexclaw": "dist/cli.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "dist/**/*",
