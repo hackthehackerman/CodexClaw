@@ -6,10 +6,12 @@ import path from "path";
 import { randomBytes } from "crypto";
 import { spawn } from "child_process";
 import { createInterface } from "readline";
+import type { Logger } from "./logger";
 import type { BlueBubblesIMessageTransportConfig, CodexClawConfig, TelegramTransportConfig } from "./config/schema";
 import { loadConfig } from "./config/loadConfig";
 import { startApp, resolveConfigPath } from "./index";
 import { createLogger } from "./logger";
+import { buildCaffeinateInvocation, KEEP_AWAKE_ENV_VAR, shouldUseKeepAwake } from "./keepAwake";
 import { resolveDefaultConfigPath } from "./paths";
 
 type CommandName = "start" | "init" | "doctor" | "help";
@@ -33,6 +35,7 @@ interface InitPreset {
   imessageConversationId?: string;
   blueBubblesPassword?: string;
   imessageAdminSenderId?: string;
+  keepAwake?: boolean;
 }
 
 type InitTransportChoice = "telegram" | "imessage";
@@ -63,7 +66,26 @@ async function main(): Promise<void> {
 
 async function runStart(parsed: ParsedArgs): Promise<void> {
   const explicitConfig = readStringFlag(parsed, "config") ?? parsed.positionals[0];
-  await startApp(explicitConfig);
+  const configPath = resolveConfigPath(explicitConfig);
+  const config = await loadConfig(configPath, createSilentLogger());
+
+  if (shouldUseKeepAwake(config)) {
+    const scriptPath = process.argv[1] ?? __filename;
+    try {
+      const exitCode = await runUnderCaffeinate(scriptPath, configPath);
+      process.exitCode = exitCode ?? 0;
+      return;
+    } catch (error) {
+      const ioError = error as NodeJS.ErrnoException;
+      if (ioError.code === "ENOENT") {
+        console.warn("caffeinate is unavailable on this machine; continuing without keep-awake mode.");
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  await startApp(configPath);
 }
 
 async function runInit(parsed: ParsedArgs): Promise<void> {
@@ -260,10 +282,12 @@ function printHelp(): void {
   console.log("  soul:   ~/.codexclaw/personality/soul.md");
   console.log("  image:  ~/.codexclaw/personality/yanny.png");
   console.log("  state:  ~/.codexclaw/state/codexclaw.db");
+  console.log("  awake:  macOS keep-awake enabled by default");
   console.log("");
   console.log("Options:");
   console.log("  --config <path>   Use an explicit config path");
   console.log("  --force           Overwrite files during init");
+  console.log("  --no-keep-awake   Disable macOS keep-awake in generated config");
   console.log("");
   console.log("Environment:");
   console.log("  CODEXCLAW_HOME         Override ~/.codexclaw");
@@ -589,6 +613,12 @@ function parseInitPreset(parsed: ParsedArgs): InitPreset {
   const blueBubblesPassword = readStringFlag(parsed, "bluebubbles-password");
   const imessageAdminSenderId = readStringFlag(parsed, "imessage-admin-sender");
 
+  const keepAwake = readBooleanFlag(parsed, "keep-awake")
+    ? true
+    : readBooleanFlag(parsed, "no-keep-awake")
+      ? false
+      : undefined;
+
   return {
     telegramChatId,
     telegramBotToken,
@@ -596,6 +626,7 @@ function parseInitPreset(parsed: ParsedArgs): InitPreset {
     imessageConversationId,
     blueBubblesPassword,
     imessageAdminSenderId,
+    keepAwake,
   };
 }
 
@@ -632,6 +663,9 @@ async function promptForInitWizard(): Promise<InitPreset> {
     console.log(`- By default it writes to ${resolveDefaultConfigPath()}.`);
     console.log("- Start with one transport and one allowed chat.");
     console.log("- Telegram is the fastest first setup. Use iMessage if BlueBubbles is already ready.");
+    if (process.platform === "darwin") {
+      console.log("- By default, CodexClaw will keep your Mac awake while it is running.");
+    }
     console.log("");
 
     const transport = await promptChoice(io, "First transport (recommended: telegram)", ["telegram", "imessage"]);
@@ -679,6 +713,7 @@ async function promptForTelegramInit(preset: InitPreset, io?: PromptSession): Pr
     const useSameChatForApprovals = preset.telegramAdminEnabled ?? (cameFromFlags
       ? true
       : await promptYesNo(reader, "Use the same Telegram DM for approvals?", true));
+    const keepAwake = await resolveKeepAwakeChoice(preset, reader, !cameFromFlags);
 
     return {
       telegramBotToken: botToken,
@@ -687,6 +722,7 @@ async function promptForTelegramInit(preset: InitPreset, io?: PromptSession): Pr
       imessageConversationId: undefined,
       blueBubblesPassword: undefined,
       imessageAdminSenderId: undefined,
+      keepAwake,
     };
   } finally {
     if (ownsInterface) {
@@ -723,6 +759,7 @@ async function promptForIMessageInit(preset: InitPreset, io?: PromptSession): Pr
         );
       }
     }
+    const keepAwake = await resolveKeepAwakeChoice(preset, reader, !cameFromFlags);
 
     return {
       telegramBotToken: undefined,
@@ -731,6 +768,7 @@ async function promptForIMessageInit(preset: InitPreset, io?: PromptSession): Pr
       blueBubblesPassword: password,
       imessageConversationId: conversationId,
       imessageAdminSenderId: adminSenderId,
+      keepAwake,
     };
   } finally {
     if (ownsInterface) {
@@ -763,6 +801,7 @@ function renderInitConfig(
     .replace(/__INIT_ALLOW_BLOCKS__/g, allowBlocks)
     .replace(/__INIT_ADMIN_BLOCKS__/g, adminBlocks)
     .replace(/__APPROVAL_POLICY__/g, approvalPolicy)
+    .replace(/__KEEP_AWAKE__/g, options.preset.keepAwake === false ? "false" : "true")
     .replace(/__IMESSAGE_ENABLED__/g, imessageEnabled ? "true" : "false")
     .replace(
       /__IMESSAGE_PASSWORD__/g,
@@ -853,6 +892,9 @@ function printInitNextSteps(configPath: string, preset: InitPreset): void {
   }
 
   console.log(`- Review ${configPath} and replace any remaining placeholder secrets.`);
+  if (preset.keepAwake !== false && process.platform === "darwin") {
+    console.log("- This config will keep your Mac awake while CodexClaw is running.");
+  }
   if (preset.imessageConversationId && !preset.imessageAdminSenderId) {
     console.log("- Approval policy was set to \"never\" because no admin sender was configured.");
     console.log(`- Run: ${renderStartCommand(configPath)}`);
@@ -888,6 +930,27 @@ function hasInitAdminRoute(preset: InitPreset): boolean {
   }
 
   return Boolean(preset.imessageConversationId && preset.imessageAdminSenderId);
+}
+
+async function resolveKeepAwakeChoice(
+  preset: InitPreset,
+  io: PromptSession,
+  shouldPrompt: boolean,
+): Promise<boolean | undefined> {
+  if (preset.keepAwake !== undefined) {
+    return preset.keepAwake;
+  }
+
+  if (process.platform !== "darwin") {
+    return false;
+  }
+
+  if (!shouldPrompt) {
+    return true;
+  }
+
+  console.log("- macOS can keep the computer awake while CodexClaw is running.");
+  return await promptYesNo(io, "Keep this Mac awake while CodexClaw is running?", true);
 }
 
 async function promptRequired(
@@ -1070,7 +1133,38 @@ async function requestJson<T>(urlString: string): Promise<T> {
   });
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+function createSilentLogger(): Logger {
+  return {
+    child: () => createSilentLogger(),
+    debug: () => undefined,
+    info: () => undefined,
+    warn: () => undefined,
+    error: () => undefined,
+  };
+}
+
+async function runUnderCaffeinate(scriptPath: string, configPath: string): Promise<number | null> {
+  const invocation = buildCaffeinateInvocation(scriptPath, configPath);
+
+  return await new Promise<number | null>((resolve, reject) => {
+    const child = spawn(invocation.command, invocation.args, {
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        [KEEP_AWAKE_ENV_VAR]: "1",
+      },
+    });
+
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      resolve(code);
+    });
+  });
+}
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

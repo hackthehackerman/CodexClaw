@@ -26,6 +26,7 @@ export const rawConfigSchema = z.object({
     })
     .optional(),
   storage: z.object({ db_path: z.string().optional() }).optional(),
+  host: z.object({ keep_awake: z.boolean().optional() }).optional(),
   web: z.object({
     enabled: z.boolean().optional(),
     host: z.string().optional(),
@@ -99,6 +100,9 @@ export function parseConfigText(rawText: string, configPath: string, logger: Log
       dbPath: configuredStateDir
         ? resolveDefaultStateDbPath()
         : resolvePath(baseDir, parsed.storage?.db_path ?? "./state/codexclaw.db"),
+    },
+    host: {
+      keepAwake: parsed.host?.keep_awake,
     },
     web: {
       enabled: parsed.web?.enabled,

@@ -79,6 +79,7 @@ cwd = "."
     if (config.transports[1]?.channel !== "telegram") {
       throw new Error("Expected Telegram transport");
     }
+    assert.equal(config.host.keepAwake, true);
     assert.equal(config.transports[1].config.botToken, "token");
     assert.equal(config.transports[1].config.mode, "polling");
     assert.deepEqual(config.transports[1].config.allowedUpdates, ["message", "callback_query"]);

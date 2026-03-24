@@ -17,6 +17,9 @@ summary = "concise"
 [storage]
 db_path = "./state/codexclaw.db"
 
+[host]
+keep_awake = __KEEP_AWAKE__
+
 [web]
 enabled = true
 host = "127.0.0.1"

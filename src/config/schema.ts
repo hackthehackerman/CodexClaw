@@ -64,6 +64,10 @@ const storageSchema = z.object({
   dbPath: z.string().min(1).default("./state/codexclaw.db"),
 });
 
+const hostSchema = z.object({
+  keepAwake: z.boolean().default(true),
+});
+
 const webSchema = z.object({
   enabled: z.boolean().default(true),
   host: z.string().min(1).default("127.0.0.1"),
@@ -173,6 +177,9 @@ export const configSchema = z.object({
   bot: botSchema,
   codex: codexSchema,
   storage: storageSchema,
+  host: hostSchema.default({
+    keepAwake: true,
+  }),
   web: webSchema.default({
     enabled: true,
     host: "127.0.0.1",

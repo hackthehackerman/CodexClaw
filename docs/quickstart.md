@@ -23,6 +23,7 @@ This creates:
 
 `codexclaw init` is interactive by default. It will walk you through a narrow first-run setup for one transport.
 If both are available, start with Telegram first. It is the simplest v0 path.
+On macOS, it will also ask whether CodexClaw should keep the computer awake while it is running. The default is yes.
 
 If you want a project-local install instead, run:
 

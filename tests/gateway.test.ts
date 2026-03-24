@@ -143,6 +143,9 @@ function buildConfig(): CodexClawConfig {
     storage: {
       dbPath: "/tmp/codexclaw.db",
     },
+    host: {
+      keepAwake: true,
+    },
     web: {
       enabled: true,
       host: "127.0.0.1",
